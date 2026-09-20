@@ -112,24 +112,28 @@ jobs:
           fi
           echo "Windows icon embedded successfully."
 
-      # This job's runs so far have hit TWO separate native
-      # STATUS_ACCESS_VIOLATION (0xc0000005) crashes. The first was
-      # diagnosed and fixed (`app::media_playback`'s real `cpal`/WASAPI
-      # stream-opening tests, now `#[ignore]`d -- see their own doc
-      # comments). A SECOND, still-undiagnosed one showed up once that
-      # was fixed. Under this crate's default parallel + captured test
-      # execution, a test that gets killed by a crash never flushes its
-      # own buffered output, so the log names no specific test at all --
-      # `--test-threads=1` is reinstated here PURELY as a diagnostic:
-      # with tests serialized, the harness prints each test's name
-      # BEFORE running it, so whichever name is left dangling with no
-      # "ok"/"FAILED" after it in the next failing run's log is the
-      # actual culprit (this is exactly how the first crash was
-      # identified). Once that test is identified, replace this
-      # comment and the flag with a real, targeted fix rather than
-      # leaving the whole suite permanently serialized.
+      # This job's runs hit real native STATUS_ACCESS_VIOLATION
+      # (0xc0000005) crashes THREE times before this, all from the
+      # exact same underlying cause: any test that calls the real
+      # `media_playback::start_playback` (which opens a real `cpal`/
+      # WASAPI audio stream) can crash the whole test binary outright
+      # on this headless runner (no real audio hardware), rather than
+      # returning the clean `Result::Err` those tests already handle
+      # gracefully -- a raw FFI-level crash bypasses Rust's `Result`/
+      # panic machinery entirely, so no amount of error handling on
+      # this side of the boundary could have caught it. `--test-
+      # threads=1` was used to identify the exact test each time (a
+      # crashed test's own buffered output never flushes under default
+      # parallel + captured execution, so serializing is what makes
+      # the harness print each test's name before it dies). All THREE
+      # real call sites are now `#[ignore]`d or rewritten to avoid the
+      # real hardware path (see `app::media_playback`'s and `app`'s own
+      # `tests` module doc comments on `play_then_pause_media_is_
+      # internally_consistent_regardless_of_audio_hardware` and
+      # `navigating_away_stops_and_clears_all_media_playback_state`),
+      # so this runs at normal parallelism again.
       - name: Run test suite against release build
-        run: cargo test --workspace --release -- --test-threads=1
+        run: cargo test --workspace --release
 
       - name: Stage release artifacts
         shell: bash

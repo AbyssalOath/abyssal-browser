@@ -6910,7 +6910,20 @@ mod tests {
     /// directly (bypassing the IPC fetch step, which `renderer`'s own
     /// tests already cover) so this can run with no live renderer
     /// session at all.
+    ///
+    /// `#[ignore]`d for the same reason as `media_playback`'s own
+    /// `start_playback_*` tests (see their doc comments): this calls
+    /// `play_media`, which calls the real `media_playback::
+    /// start_playback`, which opens a real `cpal` stream. The graceful
+    /// `Err`/no-op handling this test's own name describes only
+    /// covers a clean `cpal::Error` -- on a real, headless Windows CI
+    /// runner this instead crashed the whole test binary with a native
+    /// `STATUS_ACCESS_VIOLATION`, which is exactly the class of
+    /// failure Rust's `Result`/panic machinery cannot catch no matter
+    /// how gracefully the CALLING code (this test included) is
+    /// written.
     #[test]
+    #[ignore = "calls play_media, which opens a real audio device; crashes with STATUS_ACCESS_VIOLATION on headless Windows CI -- run manually with real audio hardware"]
     fn play_then_pause_media_is_internally_consistent_regardless_of_audio_hardware() {
         let mut browser = test_browser();
         let tab_id = browser.active_tab().id;
@@ -6950,10 +6963,25 @@ mod tests {
         );
     }
 
+    /// Deliberately does NOT call `play_media` here (an earlier version
+    /// did, "to also cover `active_playback`/`next_media_tick_at`
+    /// clearing") -- that calls the real, hardware-dependent
+    /// `media_playback::start_playback` and crashed real, headless
+    /// Windows CI with a native `STATUS_ACCESS_VIOLATION` (see
+    /// `play_then_pause_media_is_internally_consistent_regardless_of_
+    /// audio_hardware`'s own doc comment for the same failure mode).
+    /// `active_playback`/`next_media_tick_at` clearing on a REAL,
+    /// non-empty stream is still covered there, on a real audio
+    /// device, when one exists; this test covers what it safely can
+    /// without touching hardware at all -- `media_pcm_cache`/
+    /// `media_position`/`media_muted` are populated directly, so
+    /// clearing them on navigate-away is proven regardless of this
+    /// environment's audio situation. `active_playback` is asserted
+    /// empty too, but that's trivially true without a real stream ever
+    /// having been inserted -- not meaningful coverage on its own here.
     #[test]
     fn navigating_away_stops_and_clears_all_media_playback_state() {
         let mut browser = test_browser();
-        let tab_id = browser.active_tab().id;
         let node_id = dom::NodeId(1);
         browser
             .active_tab_mut()
@@ -6961,7 +6989,6 @@ mod tests {
             .insert(node_id, tiny_cached_pcm());
         browser.active_tab_mut().media_muted.insert(node_id, true);
         browser.active_tab_mut().media_position.insert(node_id, 5.0);
-        browser.play_media(tab_id, node_id); // may or may not actually start, depending on hardware
 
         browser.load_bookmarks_page();
 
