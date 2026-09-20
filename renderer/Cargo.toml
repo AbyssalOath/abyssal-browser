@@ -1,0 +1,108 @@
+[package]
+name = "renderer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "renderer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abyssal-renderer"
+path = "src/main.rs"
+
+[dependencies]
+network = { workspace = true }
+html = { workspace = true }
+css = { workspace = true }
+layout = { workspace = true }
+text = { workspace = true }
+privacy = { workspace = true }
+dom = { workspace = true }
+ipc = { workspace = true }
+
+# Parses GitHub's `/releases` API response for `update_check` — the
+# same crate (and, transitively, the same already-vetted dependency)
+# `network`'s own DNS-over-HTTPS response parsing already uses.
+serde_json = "1"
+
+# JavaScript execution — pure Rust (no C/C++ dependency, unlike V8 or
+# QuickJS), which is why it was picked over them: see src/script.rs's
+# module docs for the full reasoning. `boa_gc` is used directly (not
+# just transitively) for the `Trace`/`Finalize` impls that let native
+# functions capture plain Rust state (this crate's own `dom::NodeRef`
+# tree) safely — see that module's docs for why that's needed at all.
+boa_engine = "0.20"
+boa_gc = "0.20"
+
+# Real, spec-correct relative-URL resolution for `<script src="...">`
+# (see `script::resolve_script_url`) — already a transitive dependency
+# via `network` -> `reqwest`.
+url = "2"
+
+# Image decoding for `<img src="...">` — pure Rust throughout (no
+# default features: those pull in codecs this doesn't need; the
+# enabled ones — png/jpeg/gif/bmp — resolve to `png`/`zune-jpeg`/`gif`/
+# hand-rolled BMP parsing, and even PNG's DEFLATE dependency
+# (`flate2`) uses its own pure-Rust `miniz_oxide` backend by default,
+# not a C zlib binding) — see src/images.rs's module docs for why that
+# matters here specifically: this is untrusted, attacker-controlled
+# input, decoded inside the sandboxed renderer.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+
+# Decodes `<audio>`/`<video>` audio tracks — pure Rust throughout, the
+# same "no C dependency for untrusted-content decoding" reasoning as
+# `image` above and Boa below. Feature-gated to the containers/codecs
+# real `<audio>`/`<video src>` files actually use on the wider web
+# (MP4/M4A via `isomp4`, WebM/Ogg via `ogg`, plus the codecs inside
+# them) rather than symphonia's full codec list. See src/media.rs's
+# own module docs for why this crate stops at the AUDIO track and
+# never attempts video FRAME decoding at all.
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "ogg", "vorbis", "wav", "pcm", "flac"] }
+
+# Real per-page TEXT extraction from a real PDF's own structure (built
+# on `lopdf`, a real PDF object-model parser) — pure Rust throughout,
+# the same "no C dependency for untrusted-content parsing" reasoning as
+# `image`/`symphonia` above: there's no mature pure-Rust PDF RENDERING
+# engine at all (real visual fidelity would mean a C library like
+# pdfium/mupdf), so this crate deliberately stops at real text, not
+# real pixels — see src/pdf.rs's own module docs.
+pdf-extract = "0.12"
+
+# Linux-only process sandboxing (Landlock — kernel 5.13+, network
+# restrictions from 6.7+; seccomp-bpf syscall filtering via
+# `seccompiler`, the crate Firecracker's own VMM uses for exactly this
+# — pure Rust, no C dependency) — see src/sandbox.rs's module docs for
+# why this process specifically is the one that gets sandboxed, and
+# what it does and doesn't protect against.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
+
+# macOS-only: real `setrlimit` bindings (`RLIMIT_AS`/`RLIMIT_CPU`) for
+# `sandbox::resource_limits` — see that module's own doc comment. Not
+# needed for the Seatbelt profile itself (`sandbox_init`/
+# `sandbox_free_error` are raw `extern "C"` FFI against
+# `libsystem_sandbox.dylib`, no crate needed for those).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# Windows process sandboxing (a Job Object plus several
+# `SetProcessMitigationPolicy` hardening policies) — see
+# src/sandbox.rs's own `windows` module doc comment for exactly what
+# this does and doesn't protect against, and its top-level doc comment
+# for the "written and cross-type-checked, but never run on real
+# Windows" caveat that applies to all of it. Microsoft's own,
+# metadata-generated raw FFI bindings (not `winapi`, its unmaintained
+# predecessor) — the most authoritative source available for exact
+# struct layouts/constant values without a real Windows machine to
+# verify against.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>App UI &amp; Window - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li><a href="index.html" data-title="start here">Start Here</a></li>
+      <li><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li class="active"><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>App UI &amp; Window</h1>
+    <p>Everything here lives in <code>app/src/main.rs</code> (one large file) and <code>render/src/window.rs</code>/<code>render/src/icons.rs</code>. This page covers the parts of <code>app</code> that aren't the renderer-process plumbing (<code>01-process-model-and- ipc.md</code>) or account/sync (<code>05-account-storage-sync.md</code>) -- the window itself, the <code>Browser</code>/<code>Tab</code> state, the toolbar, the address bar, keyboard shortcuts, and the various <code>about:</code> pages.</p>
+<h2 id="the-window-event-loop-render-window">The window event loop: <code>render::window</code></h2>
+<p><code>render/src/window.rs</code> is deliberately <strong>DOM-agnostic</strong> -- it knows nothing about <code>dom</code>/<code>layout</code>/<code>script</code>. It defines two types and one function:</p>
+<ul>
+<li><code>InputEvent</code> -- every real thing that can happen: resize, mouse move/ click/scroll, typed characters, named keys (<code>Backspace</code>/<code>Enter</code>/<code>Escape</code>/ arrows/<code>Home</code>/<code>End</code>), the real keyboard shortcuts already resolved into named variants (<code>NavigateBack</code> for Alt+Left, <code>NewTab</code> for Ctrl+T, <code>Find</code> for Ctrl+F, <code>ToggleDevTools</code> for F12, <code>ToggleBookmark</code> for Ctrl+D, and so on -- see the type itself for the full list), accessibility actions (wraps <code>accesskit::Action</code> directly rather than defining a parallel vocabulary), and <code>Tick</code> (a synthetic "wake up, nothing really happened" event, sent only because a <em>previous</em> <code>Frame</code> asked for it).</li>
+<li><code>Frame</code> -- what <code>app</code>'s handler hands back after processing one event: a <code>Canvas</code> of pixels, an optional new window title, an optional <code>wake_at: Option&lt;Instant&gt;</code> (the single mechanism <code>setTimeout</code> is built on -- winit's own <code>ControlFlow::WaitUntil</code>, no polling, no background thread), and a full <code>accesskit</code> tree description.</li>
+<li><code>run_window(handler)</code> -- the actual winit/wgpu event loop, calling <code>handler</code> once per real event and presenting whatever <code>Frame</code> comes back.</li>
+</ul>
+<p>This separation is why <code>render</code> never depends on <code>app</code>, <code>dom</code>, or <code>script</code> -- it's a genuinely reusable "turn events into pixels" shell that <code>app</code>'s <code>Browser::handle_event</code> (see below) is the sole real implementation of.</p>
+<h2 id="browser-and-tab"><code>Browser</code> and <code>Tab</code></h2>
+<p><code>Browser</code> (in <code>app/src/main.rs</code>) is the one struct that owns everything that must stay singular across every open tab: the <code>RendererPool</code>, the account, the synced bookmarks/settings, theme/fingerprint/WebRTC preferences, and the window's own canvas size. <code>Tab</code> is everything that's genuinely per-tab: its <code>ipc::TabId</code> (stable for the tab's life, never reused -- deliberately NOT its position in <code>Browser::tabs</code>, which shifts whenever another tab closes), the current URL, the last laid-out <code>layout::LayoutBox</code> tree, cached title/page-signals, address bar editing state (text, cursor, selection), back/forward history (each entry pairs a URL with that page's own scroll offset, so going back restores scroll position too, not just content), <code>next_wake_at</code> (this tab's own pending timer, if any -- <code>Browser::earliest_wake_at</code> takes the minimum across every tab to decide the ONE <code>Frame::wake_at</code> deadline actually armed, since only one can be in flight at a time), <code>renderer_site</code> (which pool entry currently owns this tab's live session), and separate focus-tracking for the page's own focused input vs. the browser chrome's own text fields (the address bar, find bar, DevTools console are all "chrome" focus, entirely separate from <code>focused_page_input</code>/keyboard-focused DOM node, which live in the renderer's own <code>script::Session</code> -- <code>app</code> never touches the DOM directly, so it can't track page-side focus itself beyond "there is one, here's its id").</p>
+<p><code>Browser::handle_event</code> is the one big dispatch function every <code>InputEvent</code> goes through -- worth reading start to finish once to see how chrome-vs-page routing actually works (is the address bar being edited? is a page input focused? neither, so does this go to the page as a keyboard shortcut or fall through to the renderer as a real keystroke?).</p>
+<h2 id="the-toolbar">The toolbar</h2>
+<p><code>render::icons</code> draws every chrome icon (back/forward, reload, bookmark, account) as hand-authored <strong>vector shapes</strong> -- short vertex lists filled via <code>Canvas::fill_triangle</code>/<code>fill_circle</code>/<code>fill_polygon</code>, scaled/translated at paint time. There is deliberately no icon font and no raster image anywhere in this crate's dependency tree; every icon is drawn the same way any other box/border/glyph on the page is. <code>Browser::paint_chrome_button</code> is the shared "hit-testable button with an icon" primitive the toolbar buttons are all built from; <code>Browser::paint_tab_bar</code>/<code>paint_address_bar</code> paint the rest of the chrome.</p>
+<h2 id="the-address-bar">The address bar</h2>
+<p>Two roles in one widget: typing a URL and navigating it (bare domains like <code>example.org</code> get <code>https://</code> assumed -- see <code>resolve_url</code>), or typing one of a fixed set of real commands instead:</p>
+<p><code>bookmark</code> (toggle bookmarking the current page), <code>bookmarks</code>/<code>history</code>/ <code>downloads</code>/<code>settings</code>/<code>account</code> (open the matching <code>about:</code> page), <code>back</code>/<code>forward</code> (history navigation), <code>set theme light|dark</code>, <code>set fingerprint-resistance strict|standard</code>, <code>set webrtc allowed|blocked</code>, <code>set sync-server-url &lt;url&gt;</code>. <code>Browser::apply_setting</code> is the one place that actually applies a parsed <code>set</code> command and keeps the cached <code>theme</code>/<code>fingerprint_resistance</code>/<code>webrtc_access</code> fields in sync with what got written into <code>bookmarks.settings</code> (the synced settings map) -- see <code>SETTING_THEME</code>/<code>SETTING_FINGERPRINT_RESISTANCE</code>/<code>SETTING_WEBRTC</code>/ <code>SETTING_SYNC_SERVER_URL</code>, the four setting-key constants, centralized so the address-bar parser, the settings page's own links, and <code>apply_setting</code> itself can never drift onto different string spellings for the same key.</p>
+<h2 id="about-pages"><code>about:</code> pages</h2>
+<p>Every one of <code>bookmarks</code>/<code>history</code>/<code>settings</code>/<code>account</code>/<code>downloads</code> (plus the built-in demo page -- <code>about:demo</code>, <code>Browser::load_demo_page</code>) is built from the exact same <code>html::parse</code> → <code>css::user_agent_stylesheet</code> → <code>layout::build_layout_tree</code> pipeline any real fetched page goes through -- these are NOT a separate UI widget system, they're real, synthetic HTML strings built by Rust <code>format!()</code> calls (<code>render_settings_html</code>, <code>render_account_html</code>, etc.) and rendered through the ordinary path. That's deliberately why click-to-navigate, styling, and everything else about normal page rendering works on them "for free" -- a link inside <code>about:settings</code> is a real <code>&lt;a href="settings:..."&gt;</code> the ordinary click handler resolves.</p>
+<p>The account page specifically (<code>render_account_html</code>) is worth knowing: it shows the real account ID and real recovery code in plaintext, plus a plain <code>&lt;a href="account:sync"&gt;Sync now&lt;/a&gt;</code> pseudo-link -- see <code>05-account-storage-sync.md</code> for what actually happens when that's clicked.</p>
+<h2 id="keyboard-shortcuts-and-keyboard-only-navigation">Keyboard shortcuts and keyboard-only navigation</h2>
+<p>The full list lives in <code>InputEvent</code> itself (see above) -- <code>winit</code>'s own key event, with modifiers, gets resolved into one of those named variants <em>before</em> <code>app</code> ever sees it, so <code>Browser::handle_event</code>'s job is just "given this already-classified event, and given current chrome/page focus state, do the right thing," not raw key-code parsing.</p>
+<p>Keyboard-only page navigation (<code>Tab</code>/<code>Shift+Tab</code> to move a visible focus ring across links/buttons/inputs, <code>Enter</code>/<code>Space</code> to activate) is real, driven by <code>layout::is_keyboard_focusable</code>, and is genuinely separate from mouse hit-testing -- this is also most of what makes the <code>accesskit</code> integration (real screen-reader support) work, since assistive technology fundamentally needs a keyboard-navigable focus order to expose at all.</p>
+<h2 id="devtools">DevTools</h2>
+<p><code>F12</code> toggles a real panel with two tabs: Console (a live REPL -- typed expressions get sent to the renderer via <code>ClientMessageKind::EvalConsoleExpression</code> and run against the actual live page session) and Elements (a real DOM tree view, box-model inspector, and "pick an element on the page" mode -- <code>paint_devtools_elements_tab</code>/ <code>paint_box_model</code>/<code>paint_devtools_highlight</code> are the relevant paint functions if you're extending this).</p>
+<h2 id="downloads-userscripts-media">Downloads, userscripts, media</h2>
+<p>Downloads: <code>&lt;a download&gt;</code> triggers a real fetch through the renderer, <code>app</code> writes the bytes to the OS Downloads folder with a sanitized, de-duplicated filename (the suggested filename comes from page-controlled markup, so it's treated as hostile -- reduced to one safe path component, never allowed to overwrite an existing file). Records are stored encrypted (<code>downloads.enc</code>) and deliberately never synced (a local file path means nothing on another device).</p>
+<p>Userscripts: real <code>.js</code> files under <code>&lt;data dir&gt;/userscripts/</code>, re-read from disk on every navigation (not cached -- see <code>userscripts</code> module docs for why), filtered by <code>@match</code> patterns, run fully trusted after the page's own scripts.</p>
+<p>Media: decoding happens in the sandboxed renderer (<code>renderer::media</code>, via <code>symphonia</code>); actual audio <em>output</em> happens here in <code>app</code>, through <code>cpal</code> -- this is the one place raw, renderer-produced bulk data (decoded PCM samples) crosses back into the privileged process, as plain sample buffers with real size caps, not as anything resembling executable content.</p>
+<h2 id="gotchas-for-future-you">Gotchas for future you</h2>
+<ul>
+<li><strong><code>app</code> never touches the DOM directly, ever.</strong> If you're tempted to add a feature that needs to know something about page content beyond what <code>layout::LayoutBox</code>/<code>ipc::PageSignals</code> already expose, the real answer is almost always "add a field to what the renderer reports," not "read the DOM from <code>app</code>."</li>
+<li><strong>Chrome focus and page focus are two completely separate state machines.</strong> A keystroke has to be routed to exactly one of them (or neither) by <code>handle_event</code> -- get this wrong and you'll see either dead keys or keystrokes leaking into the wrong place.</li>
+<li><strong>A <code>Tab</code>'s <code>renderer_site</code> can be <code>None</code></strong> (never navigated yet, or currently showing a local <code>about:</code> page) -- anything that routes a message to "this tab's renderer" needs to handle that case, not assume a live session always exists.</li>
+</ul>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Start Here - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li class="active"><a href="index.html" data-title="start here">Start Here</a></li>
+      <li><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>Start Here</h1>
+    <p>This is a personal reference for understanding how this codebase actually works, why it's built the way it is, and how the pieces connect to each other -- written so future changes are easier to make with confidence. It's not aimed at outside contributors and it's not a replacement for the project's own "official" docs, which stay authoritative for anything this guide and the code ever disagree on:</p>
+<ul>
+<li><strong><code>README.md</code></strong> -- the pitch, what works today, how to build/run/use it.</li>
+<li><strong><code>ARCHITECTURE.md</code></strong> -- the map: process model, crate graph, data flow. Every crate's own <code>//!</code> module doc comment is the single most current source of truth in this codebase -- when in doubt, read the code's own comment before trusting anything written here.</li>
+<li><strong><code>THREAT_MODEL.md</code></strong> -- the honest security self-review.</li>
+<li><strong><code>TESTING.md</code></strong> -- how to run and write tests, troubleshooting.</li>
+<li><strong><code>CONTRIBUTING.md</code></strong> -- project rules, dev setup, PR/release process.</li>
+<li><strong><code>CHANGELOG.md</code></strong> -- what's actually shipped, in rough chronological order.</li>
+</ul>
+<p>This wiki exists because those documents answer "what does this do" and "what's the rule," but not always "if I wanted to change X, where would I even start, and what else would I need to understand first." That's what each numbered file here tries to do for one coherent slice of the system.</p>
+<h2 id="how-to-use-this">How to use this</h2>
+<p>Read in order the first time through -- later files sometimes lean on concepts explained earlier (especially <code>01</code>, which almost everything else assumes you've read). After that, treat it as reference: jump straight to whichever file covers the area you're about to touch.</p>
+<div class="table-wrap"><table>
+<tr><th>File</th><th>Covers</th><th>Read this before touching...</th></tr>
+<tr><td><a href="01-process-model-and-ipc.html"><code>01-process-model-and-ipc.md</code></a></td><td>The <code>app</code>/<code>renderer</code> process split, <code>RendererPool</code>/<code>RendererProcess</code>, the <code>ipc</code> crate's message shapes, life of a page load</td><td>Anything that crosses the <code>app</code>&lt;-&gt;<code>renderer</code> boundary, or adds a new IPC message/field</td></tr>
+<tr><td><a href="02-dom-html-css-layout-render.html"><code>02-dom-html-css-layout-render.md</code></a></td><td><code>dom</code>, <code>html</code>, <code>css</code>, <code>layout</code>, <code>render</code> -- parsing a page into pixels, minus JS</td><td>CSS features, layout algorithms, painting, the window itself</td></tr>
+<tr><td><a href="03-javascript-engine.html"><code>03-javascript-engine.md</code></a></td><td>Boa integration, the execution model, DOM/event bindings, <code>localStorage</code>/IndexedDB</td><td><code>renderer/src/script.rs</code>, adding any new JS API surface</td></tr>
+<tr><td><a href="04-network-and-privacy.html"><code>04-network-and-privacy.md</code></a></td><td><code>network</code> (fetch, DoH, cookies, disk cache) and <code>privacy</code> (blocklist, partitioning, fingerprinting defaults)</td><td>Fetch behavior, blocklist logic, anything privacy-sensitive</td></tr>
+<tr><td><a href="05-account-storage-sync.html"><code>05-account-storage-sync.md</code></a></td><td><code>account</code> (crypto, recovery code), <code>storage</code> (data model), <code>sync</code>/<code>sync-server</code> (push/pull)</td><td>Encryption, the account flow, sync protocol/server</td></tr>
+<tr><td><a href="06-app-ui-and-window.html"><code>06-app-ui-and-window.md</code></a></td><td><code>app</code>'s <code>Browser</code>/<code>Tab</code>, the toolbar, address bar, <code>about:</code> pages, keyboard shortcuts, DevTools</td><td>Anything in the window/UI itself</td></tr>
+<tr><td><a href="07-sandboxing.html"><code>07-sandboxing.md</code></a></td><td>Landlock/seccomp (Linux), Seatbelt (macOS), Job Object (Windows), resource limits</td><td><code>renderer/src/sandbox.rs</code>, anything that changes what the renderer does on disk/network/syscalls</td></tr>
+<tr><td><a href="08-rust-patterns-glossary.html"><code>08-rust-patterns-glossary.md</code></a></td><td>Recurring patterns and idioms used throughout: <code>Rc&lt;RefCell&lt;...&gt;&gt;</code>, version-counter persistence, merge-not-overwrite, fail-closed, testing conventions</td><td>Before writing new code, if you want it to look like it belongs here</td></tr>
+<tr><td><a href="09-troubleshooting.html"><code>09-troubleshooting.md</code></a></td><td>Real problems you'll actually hit and how to diagnose them</td><td>When something's broken and you're not sure why</td></tr>
+</table></div>
+<h2 id="the-one-paragraph-mental-model">The one-paragraph mental model</h2>
+<p><code>app</code> is the privileged process you run: it owns the window, your account, your decrypted bookmarks, and the encryption keys -- and it <strong>never links an HTTP client</strong>. Every byte of untrusted content (a fetched page, its HTML, CSS, JavaScript, images) is handled by a separate <code>abyssal-renderer</code> process, one per site, running inside a real OS sandbox, which <strong>never receives</strong> your recovery code or encryption keys. The two talk over a strict request/reply JSON protocol on a pipe. That single asymmetry -- <code>app</code> has the secrets and no network access, <code>renderer</code> has network access and no secrets -- is the one idea most worth internalizing before anything else, because a huge fraction of "why is this built this way" questions trace back to it. <code>01-process-model-and-ipc.md</code> is where that's explained in full.</p>
+<h2 id="workspace-layout-for-orientation">Workspace layout, for orientation</h2>
+<pre><code>dom/        shared Node/Element/Text tree (no deps)
+html/       html5ever -&gt; dom::Node
+css/        parsing, selectors, cascade, ComputedStyle
+text/       font loading, wrapping, glyph rasterization
+layout/     block/inline/flex/grid, box model, hit-testing
+render/     LayoutBox -&gt; pixels, the window itself (wgpu/winit)
+network/    HTTP + DNS-over-HTTPS, filtering, cookies, disk cache
+privacy/    blocklist, partitioning, fingerprinting defaults
+account/    no-email accounts, key derivation, encryption
+storage/    the SyncPayload data model (no crypto, no I/O)
+sync/       push/pull of opaque ciphertext
+sync-server/ the file-backed HTTP server sync talks to
+ipc/        the app&lt;-&gt;renderer wire protocol
+renderer/   the sandboxed process: fetch, parse, layout, JS, decode
+app/        the binary: window, UI, account, sync, the renderer pool</code></pre>
+<p>Two dependency edges are load-bearing and worth remembering by heart: <code>app</code> never depends on <code>network</code>, and <code>account</code>/<code>sync</code> never depend on each other. Both are enforced structurally (they're just not in the relevant <code>Cargo.toml</code>), not by convention -- see <code>ARCHITECTURE.md</code>'s "Design principles" for why that distinction matters.</p>
+<h2 id="keeping-this-wiki-honest">Keeping this wiki honest</h2>
+<p>If you change something this wiki describes, update the relevant file in the same change if you can -- but if a stale sentence here and the actual code ever disagree, trust the code (and the crate's own <code>//!</code> doc comment) every time. This is a map, written at a point in time, not a spec.</p>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

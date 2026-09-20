@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Account, Storage &amp; Sync - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li><a href="index.html" data-title="start here">Start Here</a></li>
+      <li><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li class="active"><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>Account, Storage &amp; Sync</h1>
+    <p>This file covers four crates that together implement Abyssal's no-email account model and cross-device sync: <code>account</code>, <code>storage</code>, <code>sync</code>, and the <code>sync-server</code> binary. Read this if you're touching anything about how bookmarks/history/settings get encrypted, merged across devices, or served.</p>
+<p>The one-sentence version of the whole pipeline:</p>
+<pre><code>storage::SyncPayload --to_bytes()--&gt; plaintext bytes
+                                          |
+                              account::encrypt(key)   (ChaCha20-Poly1305)
+                                          |
+                                      ciphertext
+                                          |
+                          sync::HttpSyncClient::push(account_id, auth_secret, ciphertext, expected_version)
+                                          |
+                                sync-server (FileSyncServer, one file per account)</code></pre>
+<p>Every arrow in that chain except the last two hops is code that lives in <code>app</code>, not in any of these four crates. That's deliberate, and it's the single most important structural fact in this whole file -- see "The <code>account</code>/<code>sync</code> boundary, and why <code>app</code> is the glue" near the end.</p>
+<h2 id="account-the-no-email-credential-and-the-real-crypto"><code>account</code>: the no-email credential and the real crypto</h2>
+<p>Source: <code>account/src/lib.rs</code>, <code>account/src/bip39.rs</code>.</p>
+<h3 id="the-model">The model</h3>
+<p>There's no email, no username, no password by default. <code>account::create_account()</code> (no arguments) mints three things, all via the OS CSPRNG (<code>rand::rngs::OsRng</code>, never a userspace PRNG):</p>
+<ul>
+<li><code>account_id</code>: a random token like <code>acct_&lt;32 hex chars&gt;</code> -- just an opaque handle the sync server uses to address a blob. Doesn't need to be secret, only unique.</li>
+<li><code>recovery_code</code>: a 15-word BIP-39 mnemonic phrase. This <strong>is</strong> the actual credential -- the only secret that unlocks anything.</li>
+<li><code>kdf_salt</code>: a random 16-byte salt, generated once and then reused forever for this account. Not secret either -- it's fine for this to be visible in <code>account.txt</code> right next to everything else, because a salt's job is to make precomputed rainbow-table attacks useless, not to be secret itself.</li>
+</ul>
+<p>Why a 15-word phrase instead of, say, a 40-character hex string carrying the same 160 bits of entropy? Because a hex blob is brutal to transcribe by hand and gives you zero feedback if you get it wrong -- you'd just have a different, silently-wrong secret. A BIP-39 mnemonic has a built-in checksum (see the <code>bip39</code> module below) that catches a misspelled or reordered word, so a bad transcription fails loudly instead of quietly generating garbage.</p>
+<h3 id="key-derivation-two-independent-secrets-from-one-phrase">Key derivation: two independent secrets from one phrase</h3>
+<p><code>derive_key(secret, salt)</code> and <code>derive_auth_secret(secret, salt)</code> both run the recovery code (or an optional password layered on top, if that ever ships) through Argon2id, but they are <strong>domain-separated</strong> -- <code>derive_auth_secret</code> prepends a fixed string (<code>"abyssal-sync-auth-v1|"</code>) to the secret before hashing, so the two outputs are cryptographically unrelated even though they come from the same input. <code>derive_key</code>'s output encrypts your data locally. <code>derive_auth_secret</code>'s output goes to the sync server so it can authenticate your pushes/pulls.</p>
+<p>This split is the whole reason the server can authenticate you without being able to read your data: if there were only one derived secret, the server would necessarily see (or be able to compute) the same value that decrypts your bookmarks. Domain separation means knowing the auth secret gives you <strong>zero</strong> information toward the encryption key.</p>
+<p>Both functions share one <code>kdf()</code> builder function, on purpose -- there's exactly one place in the whole codebase that decides what "the KDF" means, so the two call sites can never silently drift onto different parameters.</p>
+<p><strong>The actual Argon2id parameters</strong> (<code>KDF_MEMORY_COST_KIB = 128 * 1024</code> i.e. 128 MiB, <code>KDF_TIME_COST = 3</code>, <code>KDF_PARALLELISM = 1</code>) are deliberately chosen, not left at the crate's generic default (19 MiB / t=2). Two things worth understanding if you ever touch these:</p>
+<ol>
+<li><strong>Parallelism is pinned at 1 on purpose</strong>, not as an oversight. The <code>argon2</code> crate (RustCrypto's implementation) has no multi-threaded lane execution -- every lane runs serially regardless of <code>p_cost</code> -- so raising parallelism here would only add wall-clock time with zero benefit. All the "make this expensive to crack" budget goes into memory cost instead, which is the parameter that actually resists GPU/ASIC parallelization (more memory per guess is expensive to replicate across many cracking units in hardware).</li>
+<li><strong>This only ever runs locally</strong>, to protect a stolen ciphertext blob against offline brute-forcing. It never runs server-side against concurrent users, so there's no capacity cost to being generous. 128 MiB / t=3 completes in well under a second on ordinary desktop hardware in a <strong>release</strong> build -- a debug build (this workspace's default) is meaningfully slower, which is an expected dev-loop cost, not a signal the numbers are wrong.</li>
+</ol>
+<h3 id="encryption">Encryption</h3>
+<p><code>encrypt(key, plaintext) -&gt; Vec&lt;u8&gt;</code> uses ChaCha20-Poly1305, a real AEAD (authenticated encryption). A fresh random 12-byte nonce is generated per call and prepended to the ciphertext it returns -- the nonce isn't secret, it just has to be unique per encryption under a given key, and storing it next to the ciphertext is the standard way to make it available to <code>decrypt</code> later. Because it's authenticated, <code>decrypt</code> doesn't silently produce garbage on a wrong key or tampered data -- it returns a real <code>Err(DecryptError)</code>, and deliberately does <strong>not</strong> distinguish "wrong key" from "tampered ciphertext," because an AEAD's whole security property is that those two cases are indistinguishable from the outside.</p>
+<h3 id="zeroization-and-its-real-limits">Zeroization, and its real limits</h3>
+<p><code>derive_key</code>/<code>derive_auth_secret</code>/<code>decrypt</code> all return <code>Zeroizing&lt;...&gt;</code> wrappers (from the <code>zeroize</code> crate), which wipe their contents when dropped. This guarantees the key/plaintext is overwritten <em>after</em> use -- it does <strong>not</strong> guarantee the memory was never swappable to disk or never captured in a core dump while it was live. <code>mlock</code>/<code>MADV_DONTDUMP</code> would close that gap; the module's own doc comment lists it as a real, not-yet-done next step. Worth knowing if you're ever debugging something that touches derived keys: they zeroize on drop, not on creation, so a key that's still in scope is still live plaintext in ordinary process memory.</p>
+<h3 id="bip39-the-mnemonic-codec"><code>bip39</code>: the mnemonic codec</h3>
+<p><code>account/src/bip39.rs</code> implements BIP-39's encoding scheme (entropy -&gt; checksummed word indices -&gt; words, and back) using the standard 2048-word English list (<code>account/assets/bip39-english.txt</code>, verified against its known-good SHA-256 checksum, not retyped by hand). It deliberately does <strong>not</strong> implement BIP-39's separate seed-derivation step (PBKDF2-HMAC-SHA512 over the mnemonic) -- this app doesn't need it, since the mnemonic here is just fed straight into this crate's own Argon2id <code>derive_key</code>, the same way a password would be. Interop with other BIP-39 wallets' seed derivation is explicitly not a goal.</p>
+<p><code>entropy_to_mnemonic</code> is what <code>create_account</code> calls (with 20 bytes / 160 bits of entropy, producing 15 words). <code>mnemonic_to_entropy</code> is the inverse -- <strong>it exists but nothing calls it yet</strong>. There's no "restore this account on a new device by typing the recovery phrase" UI flow in <code>app</code>; today the only way <code>app</code> ever gets a recovery code back is by reading <code>account.txt</code> on the <em>same</em> device it was created on. If you build that restore flow, this function is the piece that's already done.</p>
+<h2 id="storage-the-data-model-that-knows-nothing-about-crypto"><code>storage</code>: the data model that knows nothing about crypto</h2>
+<p>Source: <code>storage/src/lib.rs</code>.</p>
+<p>This is deliberately the one crate in the whole chain with no idea encryption or networking exist. It just models "what data syncs" (<code>Bookmark</code>, <code>HistoryEntry</code>, <code>Settings</code>, all bundled into one <code>SyncPayload</code>) and can turn itself into bytes and back. That separation is what makes it trivially unit testable -- no fake crypto, no fake network, just plain data round-tripping through <code>serde_json</code>.</p>
+<p>Note, if you've read <code>network</code>'s or <code>renderer</code>'s own on-disk formats: unlike <code>PartitionedCookieJar</code>/<code>LocalStorageStore</code>/<code>IndexedDbStore</code> (which hand-build <code>serde_json::Value</code> JSON to avoid a <code>serde</code> dependency in those crates), <code>storage</code> types use ordinary <code>#[derive(serde::Serialize, serde::Deserialize)]</code> -- this crate already pulls in <code>serde</code> directly, so there's no reason not to.</p>
+<h3 id="the-three-record-types">The three record types</h3>
+<ul>
+<li><code>Bookmark { title, url, created_at_unix }</code>. Identity is the URL -- there's no separate stable ID yet, which is a real, documented limitation: if a future "rename/reorder bookmarks" feature ever needs to distinguish two edits of "the same" bookmark from "a bookmark was deleted and a new one added," it'll need a real ID field first.</li>
+<li><code>HistoryEntry { url, title: Option&lt;String&gt;, visited_at_unix }</code>. <strong>Not</strong> deduplicated by URL -- visiting the same page twice is two separate entries, matching how history (as opposed to bookmarks) actually works. Capped at <code>MAX_HISTORY_ENTRIES = 500</code>, oldest pruned first, because every sync round-trips the <em>entire</em> payload (see below) -- an unbounded history log would make every sync progressively heavier forever.</li>
+<li><code>Settings</code>: a flat <code>Vec&lt;SettingEntry { key, value, updated_at_unix }&gt;</code> (not a <code>HashMap</code>, so serialization order and the merge logic below can be deterministic-ish). Each entry independently timestamped.</li>
+</ul>
+<h3 id="syncpayload-merge-where-the-real-conflict-resolution-lives"><code>SyncPayload::merge</code> -- where the real conflict resolution lives</h3>
+<p><code>sync</code> (the crate) can <em>detect</em> that two devices diverged, but it can never <em>resolve</em> it, because it only ever holds ciphertext. <code>storage::SyncPayload::merge</code> is where the actual resolution happens, once <code>app</code> has decrypted both sides:</p>
+<ul>
+<li><strong>Bookmarks</strong>: unioned by URL. Same URL on both sides keeps whichever copy has the later <code>created_at_unix</code>.</li>
+<li><strong>Settings</strong>: delegated to <code>Settings::merge</code>, which is last-write-wins <em>per key</em> (not per whole blob) -- a key present on only one side survives untouched; a key present on both keeps whichever <code>updated_at_unix</code> is later. This is a meaningful improvement over "the whole blob from whichever side pushed last wins," which would silently drop an unrelated setting change made on the other device.</li>
+<li><strong>History</strong>: unioned by the <code>(url, visited_at_unix)</code> pair (not just URL, since the same URL legitimately appears many times), re-sorted, then re-capped to <code>MAX_HISTORY_ENTRIES</code>.</li>
+</ul>
+<p>One documented sharp edge: an exact tie (identical timestamp on both sides for the same key/URL) breaks toward <code>self</code>, so <code>a.merge(&amp;b)</code> and <code>b.merge(&amp;a)</code> can technically differ on that edge case. It only affects which of two <em>otherwise-equal</em> writes wins cosmetically -- nothing is ever dropped by it.</p>
+<p>If you're looking for where a real CRDT (an OR-Set for bookmarks, proper LWW-registers with per-replica tie-breaking for settings) would slot in -- this merge function is it. The module's own doc comment calls this out as the fully-correct answer if concurrent-edit-to-the-same-field conflicts ever become a real problem; not worth the complexity for a handful of string settings today.</p>
+<h2 id="sync-opaque-ciphertext-in-opaque-ciphertext-out"><code>sync</code>: opaque ciphertext in, opaque ciphertext out</h2>
+<p>Source: <code>sync/src/lib.rs</code>.</p>
+<p>This crate's types (<code>Blob</code>, the <code>SyncTransport</code> trait) only ever hold <code>Vec&lt;u8&gt;</code> ciphertext plus an <code>account_id</code> string. Never a <code>SyncPayload</code>, never anything from <code>account</code>. That's the actual mechanism that makes "zero-knowledge sync" true rather than a marketing claim -- this crate <em>structurally cannot</em> decrypt anything, because it never has the key, and it never even sees plaintext long enough to try.</p>
+<h3 id="three-implementations-of-synctransport">Three implementations of <code>SyncTransport</code></h3>
+<ul>
+<li><strong><code>FakeSyncServer</code></strong>: in-memory <code>HashMap</code>, no persistence. Good for fast unit tests of push/pull/conflict logic; data is gone on restart.</li>
+<li><strong><code>FileSyncServer</code></strong>: what <code>sync-server</code> actually runs. One file per account under <code>data_dir</code>, named by a SHA-256 hash of the account ID (not the raw ID -- this is what makes a hostile account ID like <code>../../etc/passwd</code> harmless; it just hashes to some hex string like any other input). Each push does a full read-modify-write of that one file, atomically (temp file + <code>rename</code>), with <strong>no</strong> in-memory cache -- every request touches disk. Fine at hobby-project request volumes; an <code>account_id -&gt; version</code> in-memory index is the documented next step if that ever changes.</li>
+<li><strong><code>HttpSyncClient</code></strong>: the real HTTP client <code>app</code> uses, talking to a real <code>sync-server</code>. <code>PUT /accounts/{id}</code> with <code>Authorization: Bearer &lt;64 hex chars&gt;</code> and <code>X-Expected-Version: &lt;n&gt;</code> to push; <code>GET /accounts/{id}</code> (same auth header) to pull, reading the version back from an <code>X-Version</code> response header.</li>
+</ul>
+<h3 id="conflict-detection-not-resolution">Conflict detection, not resolution</h3>
+<p>Every push carries the version the client <em>thinks</em> it's overwriting. <code>FileSyncServer</code>/<code>FakeSyncServer</code> compare that against the actual current version; a mismatch returns <code>SyncError::Conflict { server_version }</code> instead of silently overwriting newer data. This crate's job stops there -- it has no way to combine two devices' changes, so all it can do is refuse and let the caller (<code>app</code>) figure out what to do. See <code>app::Browser::sync_push</code> below for the actual retry-and-merge loop this conflict signal drives.</p>
+<h3 id="file-backed-backups-real-not-just-theoretical">File-backed backups (real, not just theoretical)</h3>
+<p>Every <code>FileSyncServer::push</code> snapshots the version it's about to overwrite into <code>data_dir/backups/&lt;account hash&gt;/&lt;version&gt;.blob</code> <strong>before</strong> writing the new one, keeping the most recent <code>backup_retention</code> versions (default 10, oldest pruned first). This is deliberately <em>not</em> full multi-node replication -- overkill for a single-operator deployment -- but it does mean a bad push (a client-side merge bug, a corrupted upload) doesn't silently destroy the only copy of your data. <code>restore_backup(account_id, version)</code> brings a specific version back to being live; there's no HTTP route for it, only the operator-facing <code>sync-server --restore</code> CLI flag (see below) -- a client has no legitimate reason to roll back a version out from under a possibly-concurrent other device.</p>
+<p>This does <strong>not</strong> protect against losing the whole disk. An off-box copy of <code>data_dir</code> is still an operational step outside this crate entirely.</p>
+<h2 id="sync-server-the-actual-binary"><code>sync-server</code>: the actual binary</h2>
+<p>Source: <code>sync-server/src/main.rs</code>, <code>sync-server/src/rate_limit.rs</code>.</p>
+<p>A small <code>tiny_http</code>-based HTTP server. <code>main()</code> handles two CLI flags (<code>--restore &lt;account_id&gt; &lt;version&gt;</code>, <code>--list-backups &lt;account_id&gt;</code>) before falling through to the actual server loop if neither was given.</p>
+<h3 id="the-request-loop">The request loop</h3>
+<p>For every incoming request: check the per-IP rate limit first (before doing <em>any</em> other work, including parsing the account ID) -&gt; parse <code>/accounts/{id}</code> out of the URL -&gt; extract and validate the <code>Authorization: Bearer &lt;64 hex&gt;</code> header -&gt; check the per-account lockout -&gt; dispatch to <code>store.push</code>/<code>store.pull</code> based on HTTP method. <code>PUT</code> reads the whole body into memory as the ciphertext (no streaming, no size cap -- a documented, real gap). <code>GET</code> returns the ciphertext as the response body with <code>X-Version</code> as a header.</p>
+<p><strong>Registration is trust-on-first-use</strong>: the first push for a given <code>account_id</code> establishes that account's <code>auth_secret_hash</code> (a SHA-256 hash of the auth secret, stored alongside the blob -- see <code>sync::StoredBlob</code>). Every later request against that same <code>account_id</code> must present a secret that hashes to the same value, or it's <code>401 Unauthorized</code>. There's no separate signup step; pushing <em>is</em> signing up.</p>
+<h3 id="rate-limit-ratelimiter"><code>rate_limit::RateLimiter</code></h3>
+<p>Two independent, both-in-memory mechanisms:</p>
+<ul>
+<li><strong>Per-IP</strong>: <code>MAX_REQUESTS_PER_IP_WINDOW = 30</code> per <code>IP_WINDOW = 60s</code>, a plain fixed-window counter (not a sliding log or token bucket). Stops raw hammering regardless of whether requests are authorized.</li>
+<li><strong>Per-account lockout</strong>: <code>MAX_AUTH_FAILURES = 10</code> failed-auth attempts against one <code>account_id</code> locks it out for <code>LOCKOUT_DURATION = 15 minutes</code>, <strong>even from a different IP</strong> -- this is what stops someone working around the per-IP limit by distributing guesses across many source addresses. Deliberately generous (not 3-strikes) because a legitimate second device that hasn't synced yet, or one mistyped recovery code, shouldn't lock anyone out.</li>
+</ul>
+<p>Both maps are <strong>never evicted</strong> except by their own window/lockout expiring in place -- a sustained flood of distinct <code>account_id</code>s grows the map unboundedly over a long enough time, bounded in practice only by the attacker's own per-IP request budget. A real deployment wanting stronger guarantees would want an LRU cap or periodic sweep on top; not implemented.</p>
+<h3 id="what-s-explicitly-not-here">What's explicitly NOT here</h3>
+<p>Plain HTTP, not TLS -- the module doc comment is blunt about this: run it behind a real reverse proxy that terminates TLS, because the auth secret and ciphertext both travel over whatever connection this binary itself speaks. Also: the per-IP limiter keys on the raw socket peer address and knows nothing about <code>X-Forwarded-For</code> or similar, so behind a naive reverse proxy every client would appear to share one IP's rate budget -- a trusted-proxy story is still a real gap if you ever put this behind one.</p>
+<h2 id="the-account-sync-boundary-and-why-app-is-the-glue">The <code>account</code>/<code>sync</code> boundary, and why <code>app</code> is the glue</h2>
+<p>This is the load-bearing structural fact of this whole file: <code>sync</code> has <strong>no Cargo dependency on <code>account</code></strong>, and never will by design. It's enforced at the <code>Cargo.toml</code> level, not just by convention. The consequence: <code>sync</code>'s own code has no way to accidentally gain the ability to decrypt anything, even by mistake, even in a future refactor -- the type it would need (<code>account::Account</code>, or a derived key) simply isn't reachable from that crate's dependency graph.</p>
+<p>That means something has to actually do the gluing -- <code>SyncPayload::to_bytes()</code> -&gt; <code>account::encrypt</code> -&gt; <code>sync::push</code>, and the reverse for pull. That "something" is <code>app</code> (specifically <code>Browser::sync_push</code>/<code>Browser::sync_pull</code> in <code>app/src/main.rs</code>), and it's the <em>only</em> place in the entire codebase that imports both <code>account</code> and <code>sync</code> together.</p>
+<p>Concretely, <code>sync_push</code>:</p>
+<ol>
+<li>Derives <code>key</code> (<code>account::derive_key</code>) and <code>auth_secret</code> (<code>account::derive_auth_secret</code>) fresh, from <code>self.account.recovery_code</code> + <code>self.account.kdf_salt</code> -- <strong>not cached</strong>, re-derived (full 128 MiB Argon2id cost) on every single push. This is fine here because a sync push is a comparatively rare, explicit event (adding a bookmark, editing a setting), unlike something like a cookie write which can happen on nearly every navigation -- see <code>docs/wiki/01-process-model-and-ipc.md</code> for the contrasting case where <code>app</code> <em>does</em> cache a derived key for exactly that performance reason, and why.</li>
+<li>Encrypts the current <code>self.bookmarks.to_bytes()</code> and pushes it with <code>self.sync_version</code> as the expected version.</li>
+<li>On <code>SyncError::Conflict</code>, pulls the server's current blob, decrypts it, merges it into <code>self.bookmarks</code> via <code>SyncPayload::merge</code>, saves the merged result locally, and loops to push again -- up to <code>MAX_PUSH_ATTEMPTS = 5</code> times, so a pathological case (another device pushing on every single one of <em>our</em> retries) can't loop forever.</li>
+<li>Any transport error (server unreachable) just logs and gives up -- sync is explicitly best-effort; nothing about browsing itself depends on it succeeding.</li>
+</ol>
+<p><code>sync_pull</code> is the mirror image for startup: pull whatever the server has, decrypt, <strong>merge</strong> into the local payload (never blindly overwrite it -- a device that made offline changes before its first successful pull needs those to survive), and push the merged result right back if the merge actually changed anything, so this device's own local-only additions don't have to wait for some unrelated future sync to reach the server.</p>
+<h2 id="where-to-look-next">Where to look next</h2>
+<ul>
+<li><code>app/src/main.rs</code>'s own <code>save_bookmarks</code>/<code>load_or_init_bookmarks</code>/ <code>load_or_create_account</code>/<code>write_secret_file</code> functions for how the encrypted <code>.enc</code> files actually get read/written on disk (owner-only permissions, same pattern as the cookie/localStorage/IndexedDB <code>.enc</code> files described in the network/process-model wiki pages).</li>
+<li><code>THREAT_MODEL.md</code>'s "Account and crypto" and "Sync server" sections for the security-review framing of everything in this file (known gaps, what an external audit should check first).</li>
+<li><code>TESTING.md</code>'s "Testing the sync server" section for a real, runnable <code>curl</code>-based walkthrough of the HTTP API.</li>
+</ul>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

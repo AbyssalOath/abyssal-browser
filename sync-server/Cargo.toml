@@ -1,0 +1,8 @@
+[package]
+name = "sync-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sync = { workspace = true }
+tiny_http = "0.12"

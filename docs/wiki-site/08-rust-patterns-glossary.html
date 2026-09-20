@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Rust Patterns Glossary - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li><a href="index.html" data-title="start here">Start Here</a></li>
+      <li><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li class="active"><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>Rust Patterns Glossary</h1>
+    <p>This codebase reuses the same handful of patterns over and over, in different crates, for the same reasons each time. Once you recognize one, you'll spot it everywhere -- this file is a cheat sheet so you don't have to rediscover each one from scratch the first time you meet it.</p>
+<h2 id="rc-refcell-t-for-shared-mutable-single-threaded-state"><code>Rc&lt;RefCell&lt;T&gt;&gt;</code> for shared, mutable, single-threaded state</h2>
+<p>Everywhere something needs to be visible and mutable from more than one place <em>within one process</em>, and that process is single-threaded (every process in this codebase is -- <code>app</code>'s window loop, each renderer's message loop), it's <code>Rc&lt;RefCell&lt;T&gt;&gt;</code>, never <code>Arc&lt;Mutex&lt;T&gt;&gt;</code>. Examples: <code>FilteringFetcher</code> (shared between every tab's script's own <code>fetch()</code> closure and the renderer's own top-level fetch), <code>LocalStorageStore</code>/ <code>IndexedDbStore</code> (shared across every tab in one renderer process, which is literally what makes two tabs on the same origin see each other's writes live). If you ever reach for <code>Arc</code>/<code>Mutex</code> in this codebase, stop and ask whether you've actually introduced real threading, because nothing here does that within a single process.</p>
+<h2 id="the-version-counter-gated-report-pattern">The version-counter-gated report pattern</h2>
+<p><code>PartitionedCookieJar::version()</code>, <code>LocalStorageStore::version()</code>, <code>IndexedDbStore::version()</code> are all a plain <code>u64</code> bumped on every real mutation, never on a read. The consuming side (now <code>app</code>'s <code>RendererProcess</code>, via <code>RendererState::reported_cookies_if_changed</code> and its two siblings) remembers the version as of the last time it actually reported/persisted, and only does real work (serialize, encrypt, write) when the current version differs. This is what makes the frequent, otherwise-unrelated <code>Tick</code> a playing <code>&lt;audio&gt;</code> element's progress bar sends every 250ms a genuine no-op for storage persistence, rather than a serialize-and-encrypt cycle 4 times a second. If you add a new piece of state that needs "only act when this actually changed" semantics, this is the established shape: a <code>version()</code> getter, bumped exactly at each real mutation site, never elsewhere.</p>
+<h2 id="merge-not-overwrite-keyed-by-ownership">Merge-not-overwrite, keyed by ownership</h2>
+<p><code>PartitionedCookieJar::merge_into</code>, <code>LocalStorageStore::merge_into</code>, <code>IndexedDbStore::merge_into</code> all have the identical shape: copy every key/entry <em>this</em> instance has an opinion on into the target, leave everything else in the target untouched. This exists because several independent renderer processes (one per site) each only ever create entries for their own site/origin -- so a later save from site B must never be allowed to clobber an earlier save's entries for site A, even though both eventually land in the same on-disk file. If you're persisting anything that multiple independent writers might touch, this is the pattern, not "read, replace, write."</p>
+<p>One real wrinkle: <code>app</code> can't depend on <code>network</code>/<code>renderer</code> (see below), so it can't call these real, typed methods directly for the encrypted <code>.enc</code> files -- <code>app::merge_persisted_json</code> reimplements the exact same semantics generically over raw <code>serde_json::Value</code>, keyed by field name(s) each store's own <code>to_bytes</code> doc comment documents. If you change any of those three on-disk JSON shapes, you have to update that function by hand.</p>
+<h2 id="fail-closed-not-fail-open">Fail closed, not fail open</h2>
+<p>Stated as a project rule in <code>CONTRIBUTING.md</code>, and it shows up everywhere in the actual code: a DoH failure fails the whole fetch rather than silently falling back to plaintext DNS. A malformed/undecryptable <code>.enc</code> file on load just means "start empty" (never "crash," never "silently pretend it succeeded with wrong data"). A blocked subresource simply doesn't load -- no error banner, no partial fallback content. When you add a new failure path, ask which of these two shapes it should be: "stop doing the risky thing" (fail closed -- the default for anything privacy/security relevant) or "degrade gracefully and log it" (the default for content that's just wrong/malformed, not adversarial).</p>
+<h2 id="hand-built-json-via-serde-json-value-not-derive-serialize">Hand-built JSON via <code>serde_json::Value</code>, not <code>#[derive(Serialize)]</code></h2>
+<p><code>network::PartitionedCookieJar</code>, <code>renderer::local_storage:: LocalStorageStore</code>, and <code>renderer::indexed_db::IndexedDbStore</code> all serialize via hand-built <code>serde_json::json!({...})</code> calls and manual <code>from_bytes</code> parsing, specifically so those crates only need to depend on <code>serde_json</code>, not the full <code>serde</code> derive machinery. This is a deliberate, per-crate choice, not a blanket rule -- <code>storage::SyncPayload</code> (a different crate, syncing to a server rather than crossing the app/renderer trust boundary) uses ordinary <code>#[derive(Serialize, Deserialize)]</code> instead. If you're adding a new on-disk/on-wire format, check what the crate it lives in already does before picking a style.</p>
+<h2 id="the-derive-fresh-vs-cache-once-key-derivation-tradeoff">The <code>derive fresh</code> vs <code>cache once</code> key-derivation tradeoff</h2>
+<p><code>account::derive_key</code> is deliberately, intentionally <em>slow</em> (Argon2id, 128 MiB, t=3) -- that's the whole point, it resists brute force. Every existing call site except one re-derives it fresh, right before use, and lets the <code>Zeroizing</code> wrapper drop (and wipe) it immediately after -- <code>save_bookmarks</code>, <code>save_download_history</code>, and friends all do this, because those are rare, explicit user actions (add a bookmark, finish a download). The one exception is <code>app::StoragePersistence::encryption_key</code>, cached for the whole process's lifetime specifically because cookie/<code>localStorage</code> writes can happen on nearly every navigation or script interaction --  re-deriving Argon2id that often would visibly stall the single-threaded UI event loop. If you add a new encrypted-at-rest thing, think about how <em>often</em> it saves before deciding which of these two shapes to copy.</p>
+<h2 id="boa-gc-tracing-what-needs-trace-what-can-be-empty-trace">Boa GC tracing: what needs <code>Trace</code>, what can be <code>empty_trace!()</code></h2>
+<p>Covered in depth in <code>03-javascript-engine.md</code>. The short version: any Rust struct captured into a native JS closure needs <code>Clone + Finalize + Trace</code>. If you can prove it contains zero <code>JsValue</code>/<code>JsObject</code>/<code>JsFunction</code> anywhere inside (a plain <code>Rc&lt;RefCell&lt;PlainRustData&gt;&gt;</code>, a <code>String</code>, numbers), <code>unsafe impl Trace { empty_trace!(); }</code> is honest and is the established pattern (<code>HostNode</code>, <code>HostTimers</code>, <code>HostConsole</code>, <code>FetchState</code>, <code>LocalStorageState</code>, <code>IndexedDbState</code> all do this, each with a doc comment explaining <em>why</em> it's provably safe for that specific type). If it could ever hold a live JS value, it needs a real trace implementation instead -- getting this wrong is a genuine use-after-free hazard, not just a lint.</p>
+<h2 id="unsafe-isolated-documented-rare"><code>unsafe</code>: isolated, documented, rare</h2>
+<p>Every <code>unsafe</code> block in this codebase has a <code>// SAFETY:</code> comment explaining exactly what invariant makes it sound, right above it -- not a blanket justification once per file. The real uses cluster in a few predictable places: raw FFI (<code>renderer::sandbox</code>'s macOS <code>sandbox_init</code>/Windows Job Object/mitigation-policy calls, all through officially-generated or long-stable bindings, never hand-rolled struct layouts), and a couple of Boa closure-building calls that need the <code>unsafe</code> variant of <code>NativeFunction::from_closure_with_captures</code> for their exact signature. If you're about to write <code>unsafe</code>, look for an existing, similar use first -- the SAFETY-comment convention and the general "isolate it, document the invariant" rule are both hard requirements per <code>CONTRIBUTING.md</code>, not just style preferences.</p>
+<h2 id="testing-conventions">Testing conventions</h2>
+<ul>
+<li><strong>Fake vs. real, chosen deliberately per test.</strong> <code>network::FakeFetcher</code> (register a URL, get a canned response back) is used everywhere a test doesn't specifically need real network behavior. A handful of tests in <code>app</code> and <code>renderer</code> deliberately DO hit real servers (<code>example.com</code>, <code>httpbin.org</code>) -- always with a comment explaining <em>why</em> a fake couldn't prove the thing being tested (e.g. "a real, independent server actually receiving a real POST is the one thing a fake fetcher could never prove").</li>
+<li><strong><code>test_browser()</code>/<code>state_with()</code>-style helpers</strong> give every test an isolated temp directory, never the real <code>abyssal-data</code>/OS data directory -- critical since <code>cargo test</code>'s default parallelism means tests sharing real on-disk state would be flaky and could pollute a real user's actual browsing history.</li>
+<li><strong>Cross-compilation type-checking for platforms with no real hardware available.</strong> <code>cargo check --target x86_64-apple-darwin</code> / <code>--target x86_64-pc-windows-gnu</code> catches real API mistakes (wrong struct fields, wrong constant names) in macOS/Windows-only code without ever running on that OS. When the FULL crate can't cross-compile (a transitive C dependency like <code>aws-lc-sys</code> needs a real cross-linker this environment doesn't have), an isolated scratch crate containing just the new platform-specific code (with only its own direct dependencies, e.g. <code>libc</code> or <code>windows-sys</code>) works around that and still catches the same class of real error.</li>
+<li><strong>Empirical verification over trusting a success return value</strong>, for anything security-relevant. A <code>setrlimit</code>/<code>SetInformationJobObject</code> call reporting success doesn't prove the OS is actually enforcing it -- the real check reads <code>/proc/&lt;pid&gt;/limits</code> back from a live process. A seccomp allowlist change gets proven by actually triggering a <code>SIGSYS</code>, not just by reasoning that a syscall "should" be covered.</li>
+</ul>
+<h2 id="naming-and-doc-comment-conventions">Naming and doc-comment conventions</h2>
+<p>Doc comments in this codebase explain <strong>why</strong>, not what -- a well-named function already says what it does; the comment exists for the part a reader can't get from the signature (a hidden constraint, a numeric choice that was measured rather than guessed, a tradeoff that was made deliberately). If you're writing a comment that just restates the function name in prose, delete it. Cross-references between files use the exact <code>crate::path::Item</code> or `<code> </code>Type::method<code> </code>` form so they're greppable -- follow that when you add your own.</p>
+<h2 id="where-these-rules-come-from">Where these rules come from</h2>
+<p>Most of this is written down explicitly in <code>CONTRIBUTING.md</code>'s "Project rules" and "Code style" sections -- that file is the actual source of truth for what's a hard rule vs. what's just an observed convention; this page is descriptive, that one is normative.</p>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

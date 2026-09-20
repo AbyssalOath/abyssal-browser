@@ -1,0 +1,19 @@
+[package]
+name = "dom"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The DOM crate should stay dependency-light — it's the shared
+# vocabulary every other crate speaks. If you need shared/interior
+# mutability for parent/child links, reach for `rc` + `RefCell`
+# (std) first; only add `slotmap` or an arena crate if node churn
+# becomes a real perf problem.
+
+# `derive` on `NodeType`/`Element` only — these are plain data (no
+# Rc/RefCell inside them; that wrapping only happens at the `Node`/
+# `NodeRef` level). Needed so `layout::LayoutBox` (which embeds a
+# `NodeType` per box) can cross the `renderer`<->`app` process
+# boundary as JSON — see `ipc`'s module docs for why that boundary
+# exists.
+serde = { version = "1", features = ["derive"] }

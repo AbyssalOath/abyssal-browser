@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v0.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Builds `abyssal`, `abyssal-renderer`, and `sync-server` for Linux,
+  # packaged as a flat tarball with the same Linux desktop-integration
+  # files `packaging/linux/install.sh` already gives a local dev build
+  # (that script looks for its binary/icon NEXT TO ITSELF first,
+  # specifically so it works unmodified from inside this tarball — see
+  # its own doc comment). `sync-server` ships here (and only here): see
+  # `ARCHITECTURE.md`'s process model — it's a real, independent HTTP
+  # server meant to be self-hosted somewhere (a user's own VPS, most
+  # realistically a Linux box), not a component of the desktop browser
+  # itself, so there's no reason to bloat the macOS/Windows desktop
+  # packages with a server binary nobody there would run.
+  build-linux:
+    name: build release (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (winit/wgpu link deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxkbcommon-dev libwayland-dev pkg-config \
+            libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build abyssal + abyssal-renderer + sync-server (release)
+        run: cargo build --workspace --release
+
+      - name: Run test suite against release build
+        run: cargo test --workspace --release
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/abyssal dist/
+          cp target/release/abyssal-renderer dist/
+          cp target/release/sync-server dist/
+          cp app/assets/icon.png dist/icon.png
+          cp packaging/linux/install.sh dist/
+          cp packaging/linux/abyssal-browser.desktop dist/
+          cp README.md dist/
+          tar -C dist -czf abyssal-browser-linux-x86_64.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abyssal-browser-linux-x86_64
+          path: abyssal-browser-linux-x86_64.tar.gz
+
+  # Built NATIVELY on a real `windows-latest` runner — deliberately not
+  # cross-compiled from Linux/macOS. `app/build.rs` (see its own doc
+  # comment) only actually embeds the real Windows icon resource when
+  # HOST and TARGET are both Windows, since build scripts always
+  # compile for the host and `winresource` is only pulled in as a
+  # build-dependency on a Windows host at all — a genuine cross-compile
+  # would need real changes there, not just a different invocation
+  # here. Building natively sidesteps that entirely, and is the actual
+  # fix for this project's own past "release shows a generic .exe icon"
+  # problem: that's what happens when a Windows binary gets built on a
+  # non-Windows CI runner.
+  build-windows:
+    name: build release (windows-x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Captured to a real log file (not just relying on the step's own
+      # scrollback) so the icon-embedding check below can grep it
+      # AFTER the fact — `cargo build`'s build-script warnings (see
+      # `app/build.rs`) are the ONLY signal that icon embedding
+      # silently failed, and they're only printed on a build that
+      # actually RE-RUNS the build script, not a no-op cached one, so
+      # this has to read the output of this exact invocation rather
+      # than re-building afterward just to inspect it.
+      - name: Build abyssal + abyssal-renderer (release)
+        shell: bash
+        run: cargo build --release -p abyssal -p renderer 2>&1 | tee build.log
+
+      # A hard CI failure, not a warning-and-move-on: this is the one
+      # regression this whole native-Windows-runner setup exists to
+      # prevent, so it's worth failing loudly and immediately rather
+      # than shipping a release with the exact generic-icon problem
+      # this pass was meant to fix.
+      - name: Verify the Windows icon was actually embedded
+        shell: bash
+        run: |
+          if grep -q "could not embed the Windows icon resource" build.log; then
+            echo "::error::Windows icon embedding failed — see the build log above for the real reqwest/winresource error."
+            exit 1
+          fi
+          echo "Windows icon embedded successfully."
+
+      - name: Run test suite against release build
+        run: cargo test --workspace --release
+
+      - name: Stage release artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/abyssal.exe dist/
+          cp target/release/abyssal-renderer.exe dist/
+          cp README.md dist/
+          cd dist
+          7z a ../abyssal-browser-windows-x86_64.zip . >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abyssal-browser-windows-x86_64
+          path: abyssal-browser-windows-x86_64.zip
+
+  # Built NATIVELY on real Intel (`macos-15-intel`) and Apple Silicon
+  # (`macos-14`) runners — `packaging/macos/build_app.sh` (which does
+  # the actual `cargo build` itself, plus the real `.app` bundle/
+  # `.icns` via `iconutil`) explicitly refuses to run anywhere but real
+  # macOS, so there's no cross-compiled alternative to consider here at
+  # all. Unsigned/unnotarized (see that script's own doc comment for
+  # why, and the Gatekeeper "right-click, Open" workaround every
+  # release's notes should mention).
+  build-macos:
+    name: build release (macos-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-14
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run test suite against release build
+        run: cargo test --workspace --release
+
+      - name: Build the real .app bundle
+        run: bash packaging/macos/build_app.sh
+
+      - name: Zip the .app bundle
+        run: zip -r "abyssal-browser-macos-${{ matrix.arch }}.zip" "Abyssal Browser.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: abyssal-browser-macos-${{ matrix.arch }}
+          path: abyssal-browser-macos-${{ matrix.arch }}.zip
+
+  publish:
+    name: publish GitHub release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
+          generate_release_notes: true
+          # Every tag before a stable 1.0 is treated as a pre-release —
+          # see README's "Honest security status" section: no audit yet,
+          # not something to hand to anyone as a finished product.
+          prerelease: true

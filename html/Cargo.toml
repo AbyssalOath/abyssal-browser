@@ -1,0 +1,35 @@
+[package]
+name = "html"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dom = { workspace = true }
+
+# Real HTML5 tokenization + tree construction (insertion modes, error
+# recovery, implied tags — all of it) delegated to html5ever, the
+# same parser Servo/Firefox use. `src/rcdom.rs` is a VENDORED copy of
+# html5ever's own reference DOM implementation ("RcDom", used by
+# html5ever's own test suite) — we parse into that tree, then run a
+# small conversion pass (see src/lib.rs) into our own `dom::Node` tree,
+# rather than hand-writing a `TreeSink` against our DOM directly. That
+# sidesteps needing our `dom::Element` to store namespace-qualified
+# names just to satisfy html5ever's `TreeSink::elem_name` — a real
+# constraint of implementing TreeSink directly against an arbitrary
+# DOM type.
+#
+# It's vendored rather than a dependency on `markup5ever_rcdom`
+# because crates.io lists that crate as "0.39.0+unofficial": the
+# html5ever repo's own Cargo.toml marks rcdom `publish = false`, so
+# that crate is a third-party republish of html5ever's in-tree test
+# code, not something the html5ever maintainers actually publish or
+# version. See `src/rcdom.rs`'s own doc comment for the full
+# rationale and what was trimmed relative to upstream.
+#
+# `markup5ever` and `tendril` are already pulled in transitively by
+# html5ever (same versions locked in Cargo.lock) — listing them here
+# too just makes `src/rcdom.rs`'s direct use of their types explicit,
+# it doesn't add anything new to the dependency tree.
+html5ever = "0.39"
+markup5ever = "0.39"
+tendril = "0.5"

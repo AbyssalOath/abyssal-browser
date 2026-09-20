@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Abyssal Browser
+Comment=A personal, privacy/security-focused web browser
+Exec=@EXEC_PATH@ %U
+Icon=abyssal-browser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=abyssal-browser

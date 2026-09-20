@@ -1,0 +1,14 @@
+[package]
+name = "text"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# `fontdue` is a pure-Rust glyph rasterizer: no font *shaping* (no
+# kerning pairs, no ligatures, no complex-script/RTL support) — it
+# measures and rasterizes one codepoint at a time. That's a real
+# limitation for anything beyond basic Latin text, but it's enough to
+# get real, readable words on screen without pulling in a full shaping
+# stack. `cosmic-text` (which wraps `rustybuzz` for shaping) is the
+# upgrade path once ligatures/kerning/complex scripts matter.
+fontdue = "0.8"

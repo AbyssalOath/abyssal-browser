@@ -1,0 +1,42 @@
+[package]
+name = "render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+layout = { workspace = true }
+text = { workspace = true }
+
+# Real windowing/GPU stack. Pinned versions matter here: wgpu 0.19
+# expects raw-window-handle 0.6, and winit 0.29 needs the "rwh_06"
+# feature enabled to implement the traits wgpu 0.19 expects — without
+# it, `create_surface` won't compile. If you bump either version,
+# check that they still agree on a raw-window-handle version.
+wgpu = "0.19"
+winit = { version = "0.29", features = ["rwh_06"] }
+pollster = "0.3"
+
+# Real OS accessibility tree exposure (AT-SPI on Linux, UIA on Windows,
+# NSAccessibility on macOS) for a real screen reader — see
+# `window`'s own module docs. Pure Rust throughout the stack this
+# pulls in (down through its own D-Bus/AT-SPI bindings on Linux), so
+# it doesn't compromise this crate's "no C dependencies" posture the
+# way a C accessibility toolkit binding would. Pinned to the exact
+# version whose OWN `winit` dependency resolves to the SAME 0.29.x
+# this crate already uses — `accesskit_winit`'s newer releases moved
+# to winit 0.30, which would otherwise silently pull in a SECOND,
+# incompatible copy of winit's `Window`/event types alongside this
+# crate's own.
+accesskit = "=0.12.3"
+accesskit_winit = "=0.18.0"
+
+# For turning the CPU pixel buffer into a viewable file while
+# prototyping without a window at all:
+# image = "0.25"
+
+[dev-dependencies]
+# Only used by this crate's own unit tests, to build a tiny DOM +
+# stylesheet to paint against — render itself has no dependency on
+# dom/css for its actual paint() logic.
+dom = { workspace = true }
+css = { workspace = true }

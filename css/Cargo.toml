@@ -1,0 +1,17 @@
+[package]
+name = "css"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dom = { workspace = true }
+
+# `cssparser` (used by Servo/Firefox's style engine) gives you a
+# spec-compliant tokenizer for free and is worth reaching for once
+# this stub's hand-rolled tokenizer starts creaking:
+# cssparser = "0.31"
+
+# `derive` on `ComputedStyle` only — plain data, needed so
+# `layout::LayoutBox` (which embeds one per box) can cross the
+# `renderer`<->`app` process boundary as JSON. See `ipc`'s module docs.
+serde = { version = "1", features = ["derive"] }

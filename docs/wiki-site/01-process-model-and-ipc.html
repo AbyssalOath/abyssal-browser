@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Process Model &amp; IPC - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li><a href="index.html" data-title="start here">Start Here</a></li>
+      <li class="active"><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>Process Model &amp; IPC</h1>
+    <p>This is the single most important thing to understand about this codebase before touching anything else: <strong>there are two kinds of process, and they trust each other asymmetrically.</strong></p>
+<pre><code>app (privileged, one instance)
+    &lt;==  ipc::ClientMessage / ipc::ServerMessage, length-prefixed JSON  ==&gt;
+abyssal-renderer (sandboxed, one process per SITE)</code></pre>
+<p><code>app</code> (package <code>abyssal</code>, source in <code>app/src/main.rs</code> -- yes, it's one huge file) is the process you actually run. It owns the window, the account, the recovery code, derived encryption keys, decrypted bookmarks, and the sync client. It <strong>never links <code>network</code></strong> -- there is no HTTP client compiled into it at all, enforced by <code>app/Cargo.toml</code> simply not depending on that crate. Every real fetch, including background stuff like the update checker, goes through a <code>renderer</code> process.</p>
+<p><code>renderer</code> (binary <code>abyssal-renderer</code>, source in <code>renderer/src/*.rs</code>) is where every byte of untrusted, attacker-influenced content gets touched: HTML parsing, CSS, layout, JavaScript execution, image/audio/PDF decoding, the actual network fetch. It runs inside a real OS sandbox (see <code>07-sandboxing.md</code>) and -- this is the load-bearing property -- <strong>it never receives the account's recovery code, derived encryption keys, or decrypted bookmarks/settings.</strong> There is no field anywhere in <code>ipc::RenderRequest</code> or any other message <code>app</code> sends that carries any of those. If a memory-safety bug or a hostile page somehow fully compromises a renderer process, there is nothing in that process worth stealing beyond whatever that one process's own tabs currently have loaded -- no way to reach into <code>app</code>'s secrets. Every time you add a new field to a message that crosses this boundary, ask yourself: could this ever legitimately need to be the encryption key, the recovery code, or plaintext bookmark data? If yes, stop -- that's a real change to the threat model, not just a new feature.</p>
+<h2 id="site-isolation-rendererpool">Site isolation: <code>RendererPool</code></h2>
+<p><code>app</code> doesn't talk to one <code>abyssal-renderer</code> process -- it talks to a whole <em>pool</em> of them, one per distinct site. This is <code>RendererPool</code> (<code>app/src/main.rs</code>), and it's genuinely simple:</p>
+<pre class="lang-rust"><code>struct RendererPool {
+    processes: HashMap&lt;String, RendererProcess&gt;,  // keyed by site, e.g. "example.com"
+    cache_dir: PathBuf,
+    storage_persistence: StoragePersistence,       // see below
+}</code></pre>
+<p><code>get_or_spawn(&amp;mut self, site: &amp;str)</code> spawns a fresh <code>RendererProcess</code> the first time a site is needed and reuses it for every later tab that also navigates there. <code>site_for_url(url)</code> computes the site key via <code>privacy::registrable_domain</code> -- the real Public Suffix List eTLD+1, not just the hostname, so <code>www.example.com</code> and <code>example.com</code> share a process but <code>example.com</code> and <code>evil.example.com</code> still do NOT (subdomains of the same registrable domain do share, by design -- <code>sub.example.com</code> and <code>example.com</code> both map to <code>example.com</code>).</p>
+<p>Why per-site rather than one shared renderer: sandboxing alone protects <code>app</code>'s secrets from a compromised renderer, but it does nothing to stop a compromised renderer from reading a <em>different open tab's</em> DOM, cookies, or script state if they'd shared a process. One process per site closes exactly that gap -- a bug triggered by site A's page can't read site B's tab even if both are open right now.</p>
+<p><code>evict_unreferenced(&amp;mut self, referenced: &amp;HashSet&lt;String&gt;)</code> kills any process no currently-open tab's <code>renderer_site</code> field names any more. This is a real <code>kill()</code> -- <code>SIGKILL</code>, no graceful-shutdown hook -- which is exactly why cookies/<code>localStorage</code>/IndexedDB persistence has to happen incrementally after every message rather than "on exit" (see below and <code>05-*.md</code> for the encryption side of this).</p>
+<p><strong>One site key is special: <code>LOCAL_FILES_SITE</code>.</strong> <code>site_for_url</code> checks the URL's scheme before it ever computes a registrable domain -- every <code>file://</code> URL, regardless of its actual path, maps to this one fixed key instead. That routes every local file any tab ever opens to the SAME one dedicated <code>RendererProcess</code>, spawned with a <code>--allow-local-files</code> flag no other process ever receives, which trades broad real filesystem read access for giving up outbound network access entirely (see <code>07-sandboxing.md</code>'s own section on this for the full reasoning). It's the same <code>RendererPool</code> mechanism above, reused as a security boundary between "the local filesystem" and "the open internet" rather than just between two different websites.</p>
+<h2 id="rendererprocess-one-child-one-pipe-pair"><code>RendererProcess</code>: one child, one pipe pair</h2>
+<p>Each <code>RendererProcess</code> owns a real <code>std::process::Child</code> plus its piped stdin/stdout, framed with <code>ipc::{read_message, write_message}</code>. The interesting methods, roughly in the order you'd actually read them:</p>
+<ul>
+<li><strong><code>spawn(cache_dir, storage_persistence)</code></strong> -- starts the child with <code>cache_dir</code> as its one command-line argument (the only filesystem location it's allowed to touch -- see <code>07-sandboxing.md</code>), piping stdin/stdout but <strong>inheriting stderr</strong>, so the renderer's own sandbox-status lines and fetch errors show up directly in your terminal. <code>storage_persistence</code> is a small <code>StoragePersistence</code> struct (the account's derived encryption key, plus the paths to <code>cookies.enc</code>/<code>local_storage.enc</code>/ <code>indexed_db.enc</code>) -- cloned into every process this pool spawns.</li>
+<li><strong><code>render(tab_id, request)</code></strong> -- sends <code>Navigate</code>. On this specific process's very first call (<code>!self.seeded</code>), it also reads and decrypts whatever's currently on disk and stuffs it into <code>request.initial_cookies</code>/ <code>initial_local_storage</code>/<code>initial_indexed_db</code> before sending -- see the "storage persistence" section below.</li>
+<li><strong><code>click</code>/<code>focus</code>/<code>blur</code>/<code>text_input</code>/<code>move_keyboard_focus</code>/ <code>activate_focused</code>/<code>focus_node</code></strong> -- each just wraps the matching <code>ClientMessageKind</code> variant and calls <code>send_foreground_action</code>, which respawns-and-retries on a pipe failure (see below) and falls back to <code>Unchanged</code> if even that fails, rather than surfacing a full error page for what's usually a much less disruptive failure than a dead navigation.</li>
+<li><strong><code>tick(tab_id)</code></strong> -- sends <code>Tick</code>. Deliberately does <strong>not</strong> respawn-and-retry: a tick fires in the background, often for a tab nobody's even looking at, so silently treating a dead renderer as "nothing happened this time" is the right failure mode. The next real user action against that tab will discover and recover from the same dead process anyway.</li>
+<li><strong><code>check_for_update</code></strong> -- sends <code>CheckForUpdate</code>, used by the dedicated <code>update_checker_process</code> (a <code>RendererProcess</code> that deliberately isn't part of the site pool -- see its own doc comment on why: pool eviction would kill it every time no tab happened to reference its "site").</li>
+<li><strong><code>send_with_respawn(message)</code></strong> -- the shared "try once, and on a pipe failure kill the child, spawn a fresh one, retry exactly once" logic <code>render</code> and <code>click</code>-family methods build on. A respawn loses every tab's session state in that renderer (fresh Boa contexts, fresh DOM) -- this method doesn't try to reconstruct anything beyond resending the one message it was asked to send.</li>
+<li><strong><code>try_send(message)</code></strong> -- the actual <code>write_message</code> + <code>read_message</code> round trip. This is the <strong>one chokepoint every single message this process ever sends a renderer passes through</strong>, which is exactly why it's also where <code>persist_reported_storage</code> gets called (see below) -- one place to intercept every reply, regardless of which higher-level method triggered it.</li>
+</ul>
+<h2 id="the-ipc-crate-framing-and-message-shapes">The <code>ipc</code> crate: framing and message shapes</h2>
+<p>Defined in <code>ipc/src/lib.rs</code>. The wire format is a 4-byte length prefix followed by a JSON body, over the child's stdin/stdout (<code>read_message</code>/<code>write_message</code>). <code>MAX_MESSAGE_LEN</code> is 64 MiB -- <code>app</code> refuses to allocate for anything bigger than that when it reads a length prefix from the <em>less trusted</em> side, so a compromised renderer can't force an unbounded allocation just by lying about how much data is coming.</p>
+<p>The protocol is <strong>strict lockstep</strong>: every <code>ClientMessage</code> gets exactly one <code>ServerMessage</code> reply, always. There is no renderer-initiated push at all -- if the renderer wants <code>app</code> to do something later (like fire a <code>setTimeout</code>), it can only ever <em>report</em> that fact on its next reply, never proactively send a message on its own. This is why timers work the way they do: <code>RenderSuccess::next_wake_in_millis</code> tells <code>app</code> "this tab has a pending timer roughly this many milliseconds out," and <code>app</code> schedules its own wake-up via the window event loop (<code>render::window</code>'s <code>Frame::wake_at</code>) and sends a real <code>Tick</code> when it fires. No polling, no background thread on either side.</p>
+<p><code>ClientMessageKind</code> (client → renderer) variants: <code>Navigate</code>, <code>CloseTab</code>, <code>Tick</code>, <code>Click</code>, <code>Focus</code>, <code>Blur</code>, <code>TextInput</code>, <code>CheckForUpdate</code>, <code>Download</code>, <code>FetchAudioPcm</code>, <code>UpdateMediaPlayback</code>, <code>EvalConsoleExpression</code>, <code>FetchDomSnapshot</code>, <code>MoveKeyboardFocus</code>, <code>ActivateFocused</code>, <code>FocusNode</code>.</p>
+<p><code>ServerMessageKind</code> (renderer → client) variants: <code>Rendered(RenderSuccess)</code>, <code>Error(String)</code>, <code>Closed</code>, <code>Unchanged { next_wake_in_millis }</code>, <code>UpdateCheckResult</code>, <code>DownloadResult</code>, <code>AudioPcmResult</code>, <code>DomSnapshotResult</code>.</p>
+<p>Every <code>ServerMessage</code> is <code>{ tab_id, kind, updated_cookies, updated_local_storage, updated_indexed_db }</code> -- the three <code>updated_*</code> fields are <code>Option&lt;Vec&lt;u8&gt;&gt;</code>, present only when that particular store actually changed since the last reply that reported it (see below).</p>
+<p><code>RenderRequest</code> (the payload of <code>Navigate</code>) carries the URL, an optional POST body, the top-level host (for first/third-party classification), the canvas width, the active theme name, the already-filtered list of matching userscripts' raw source, and the three optional <code>initial_*</code> seed fields.</p>
+<h2 id="storage-persistence-rides-the-existing-channel">Storage persistence rides the existing channel</h2>
+<p>Cookies, <code>localStorage</code>, and IndexedDB all used to be written straight to disk <strong>by the renderer itself</strong>, in plaintext. That changed (see the <code>05-account-storage-sync.md</code> file for the encryption side, and <code>git log</code>/<code>CHANGELOG.md</code> if you want the exact history) -- the renderer never gets the account's encryption key, so it can no longer be the one writing these files. Instead of adding new message types for this, the existing <code>Navigate</code> request and every <code>ServerMessage</code> reply just got three extra optional fields each:</p>
+<ul>
+<li><code>RenderRequest::initial_cookies</code> / <code>initial_local_storage</code> / <code>initial_indexed_db</code> -- set ONLY by <code>RendererProcess::render</code>, ONLY on that specific process's first-ever <code>Navigate</code>. <code>app</code> reads and decrypts <code>cookies.enc</code>/<code>local_storage.enc</code>/<code>indexed_db.enc</code> right there and attaches the real plaintext bytes. The renderer merges them into its live, in-memory stores via each type's own real <code>merge_into</code> (see <code>renderer::RendererState::seed_storage_from_request</code>).</li>
+<li><code>ServerMessage::updated_cookies</code> / <code>updated_local_storage</code> / <code>updated_indexed_db</code> -- set by the renderer, on ANY reply, whenever that store's own version counter changed since the last reply that reported it (<code>RendererState::reported_cookies_if_changed</code> and its two siblings). <code>app</code>'s <code>RendererProcess::try_send</code> checks these on every single incoming reply and, if present, encrypts and merges them into the matching <code>.enc</code> file (<code>persist_reported_storage</code> → <code>persist_encrypted_merge</code>).</li>
+</ul>
+<p>Why this design instead of a dedicated message type: it needed zero new round trips (persistence just rides whatever message was already being sent for an unrelated reason) and it keeps the "renderer never holds the key" property completely intact -- the renderer only ever moves its own already-in-memory plaintext bytes across a channel that already existed.</p>
+<p>One real wrinkle worth knowing if you touch this: <code>app</code> can't depend on the <code>network</code>/<code>renderer</code> crates (the "<code>app</code> never links <code>network</code>" boundary is structural, not just a style rule), so it can't call the real, typed <code>merge_into</code> methods on <code>PartitionedCookieJar</code>/<code>LocalStorageStore</code>/ <code>IndexedDbStore</code> directly. <code>app::merge_persisted_json</code> reimplements the same "overwrite only the entries this report has an opinion on" semantics generically over raw <code>serde_json::Value</code>, keyed by field name(s) (<code>"origin"</code> for <code>localStorage</code>/IndexedDB, the compound <code>["top_level_site", "resource_host"]</code> for cookies). If you ever change any of those three types' on-disk JSON shape, you have to update <code>merge_persisted_json</code> by hand -- nothing checks that they stay in sync.</p>
+<h2 id="life-of-a-page-load-end-to-end">Life of a page load, end to end</h2>
+<ol>
+<li><strong>Input.</strong> User types a URL, clicks a link, or presses back. <code>Browser::navigate_without_history_with_body</code> (in <code>app/src/main.rs</code>) resolves it and builds an <code>ipc::RenderRequest</code>.</li>
+<li><strong>Pick a process.</strong> <code>site_for_url(url)</code> computes the site key, <code>self.renderers.get_or_spawn(&amp;site)</code> reuses or spawns.</li>
+<li><strong>Send.</strong> <code>RendererProcess::render</code> seeds if needed, then sends <code>Navigate</code> through <code>send_with_respawn</code>.</li>
+<li><strong>Fetch (renderer).</strong> <code>renderer::navigate</code> runs <code>FilteringFetcher</code> (blocklist, redirect-hop checking, DoH, TLS), parses HTML, builds the author stylesheet, runs scripts, resolves images/media/stylesheets, and builds a <code>script::Session</code>.</li>
+<li><strong>Layout (renderer).</strong> The session's DOM gets laid out into a <code>layout::LayoutBox</code> tree with real pixel geometry.</li>
+<li><strong>Reply.</strong> <code>ServerMessageKind::Rendered(RenderSuccess)</code> goes back: the tree, the title, page signals, console messages, <code>next_wake_in_millis</code>, and (if anything changed) the three <code>updated_*</code> storage fields.</li>
+<li><strong>Paint (app).</strong> <code>render::paint</code> rasterizes the tree, <code>render::window</code> presents it, <code>app::accessibility</code> rebuilds the <code>accesskit</code> tree from the same <code>LayoutBox</code>.</li>
+</ol>
+<p>Clicks are special: <code>app</code> never sends pixel coordinates to the renderer at all. It hit-tests locally against the <code>LayoutBox</code> snapshot it already has (<code>layout::hit_test_node</code>) and sends only the resolved <code>dom::NodeId</code>. The renderer then walks the <em>live</em> DOM's real parent pointers to build that node's actual ancestor chain and runs the real three-phase (capture/target/ bubble) event dispatch from there. <code>app</code> applies the click's default action (link navigation) only if nothing along that chain called <code>preventDefault()</code> -- see <code>03-javascript-engine.md</code> for the dispatch mechanics themselves.</p>
+<h2 id="gotchas-for-future-you">Gotchas for future you</h2>
+<ul>
+<li><strong>A <code>Click</code>/<code>Focus</code>/etc. for a stale <code>dom::NodeId</code> is not an error.</strong> The page could have navigated between <code>app</code> resolving the hit-test and the message arriving. Both sides model this as <code>Unchanged</code>, not <code>Error</code> -- if you're adding a new per-node message kind, follow that pattern.</li>
+<li><strong>A respawn silently drops all of that process's session state.</strong> Every tab on that site loses its live Boa context, its DOM, its pending timers. This is accepted as a rare, recoverable failure, not defended against -- don't build a message kind that assumes state survives a respawn.</li>
+<li><strong><code>seeded</code> resets to <code>false</code> on respawn</strong>, deliberately. A genuinely fresh child process really does start with empty in-memory stores and genuinely does need re-seeding, so this is correct, not a bug to "fix."</li>
+<li><strong>If you add a new field to <code>ClientMessage</code>/<code>ServerMessage</code>, ask whether it needs to be OPTIONAL</strong> with a sane default for old messages that don't set it (<code>#[serde(default)]</code>), especially if it's meant to only fire under specific conditions like the storage fields do.</li>
+</ul>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

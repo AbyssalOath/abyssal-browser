@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Troubleshooting - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li><a href="index.html" data-title="start here">Start Here</a></li>
+      <li><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li class="active"><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>Troubleshooting</h1>
+    <p><code>TESTING.md</code>'s own "Troubleshooting" section is the quick-reference version of most of this -- short, symptom-to-fix. This page is the narrative companion: the same problems, explained in more depth, plus a few real lessons learned while building this project that aren't written down anywhere else yet.</p>
+<h2 id="the-abyssal-renderer-binary-was-not-found">"the abyssal-renderer binary was not found"</h2>
+<p><code>cargo run -p abyssal</code> does <strong>not</strong> build <code>abyssal-renderer</code> for you -- there's no Cargo dependency between the <code>app</code> and <code>renderer</code> packages (see <code>01-process-model-and-ipc.md</code> for why they're separate binaries at all). Run <code>cargo build --workspace</code> (or at minimum <code>cargo build -p renderer</code>) first. <code>app</code> checks for the binary eagerly at startup specifically so this fails with an actionable message immediately, rather than on your first real navigation.</p>
+<h2 id="link-errors-mentioning-alsa-asound-x11-xkbcommon-wayland">Link errors mentioning ALSA/asound, X11/xkbcommon/Wayland</h2>
+<p>System library dependencies for <code>cpal</code> (audio) and <code>winit</code>/<code>wgpu</code> (windowing/GPU), not a Rust problem. On Debian/Ubuntu:</p>
+<pre class="lang-bash"><code>sudo apt install libx11-dev libxkbcommon-dev libwayland-dev pkg-config \
+                 libasound2-dev libgl1-mesa-dev</code></pre>
+<h2 id="window-fails-to-open-with-an-adapter-panic-request-adapter-returned-none">Window fails to open with an adapter panic (<code>request_adapter</code> returned <code>None</code>)</h2>
+<p>No usable Vulkan device found. Install <code>mesa-vulkan-drivers vulkan-tools</code> and run <code>vulkaninfo</code> -- it should print your GPU's name. If it doesn't, that's the real problem to fix (a driver issue), not something in this codebase.</p>
+<h2 id="the-renderer-dies-with-sigsys-bad-system-call">The renderer dies with <code>SIGSYS</code> ("Bad system call")</h2>
+<p>The seccomp allowlist (<code>renderer::sandbox::linux::ALLOWED_SYSCALLS</code>) is missing a syscall your libc/kernel/a new code path actually needs. Look for <code>type=1326</code> lines with a <code>syscall=</code> number in <code>dmesg</code>/<code>journalctl -k</code> if audit logging is enabled, or trace the renderer directly with <code>strace</code>. This is genuinely the most likely failure the first time you run this on a new distro or a new CI runner -- see <code>07-sandboxing.md</code> for the real methodology to re-derive the list, and never just add a syscall because a crash mentions it without confirming it's legitimate.</p>
+<h2 id="landlock-not-fully-enforced-warning">"Landlock ... not fully enforced" warning</h2>
+<p>Your kernel is older than 6.7 (or has Landlock disabled). The renderer still runs, with fewer restrictions -- this is expected on older systems, not a bug, and <code>renderer::sandbox::linux::apply</code> deliberately never refuses to start over it.</p>
+<h2 id="app-tests-fail-offline-or-behind-a-strict-firewall"><code>app</code> tests fail offline or behind a strict firewall</h2>
+<p>Several tests make real fetches (<code>example.com</code>, <code>example.org</code>, <code>httpbin.org</code>) through real DoH and TLS -- this is deliberate (see <code>08-rust-patterns-glossary.md</code>'s note on when this codebase reaches for a real network test vs. a fake fetcher). DoH itself goes to <code>1.1.1.1</code>/<code>1.0.0.1</code> on port 443, and the whole fetch fails closed if that's unreachable -- which is correct behavior, not a bug, if you're testing that specific failure mode. Otherwise use <code>cargo test --workspace --exclude abyssal</code> to skip everything that needs a network.</p>
+<h2 id="cross-compilation-for-macos-windows-type-checking-hits-a-wall">Cross-compilation for macOS/Windows type-checking hits a wall</h2>
+<p><code>cargo check -p renderer --target x86_64-apple-darwin</code> (or <code>--target x86_64-pc-windows-gnu</code>) is the normal way to catch real API mistakes in platform-specific code without real hardware -- but the FULL crate often can't finish, because <code>reqwest</code>'s TLS stack pulls in <code>aws-lc-sys</code>, which needs a real C cross-compiler (<code>clang</code> targeting Darwin, or <code>x86_64-w64-mingw32-gcc</code> for Windows) that a normal dev machine/CI runner usually doesn't have installed. You'll see an error like <code>failed to run custom build command for aws-lc-sys</code> or <code>failed to find tool "x86_64-w64-mingw32-gcc"</code>.</p>
+<p><strong>The real workaround, used throughout this project's own sandboxing work</strong>: if the code you actually need to check is small and has few dependencies of its own (a new function in <code>sandbox.rs</code>, say), copy just that code into an isolated scratch crate (in your scratchpad directory, never inside this repo) whose <code>Cargo.toml</code> only lists the specific dependency it needs (<code>libc</code>, or <code>windows-sys</code> with the right feature list -- copy the exact feature list from <code>renderer/Cargo.toml</code>'s own <code>[target.'cfg(...)'.dependencies]</code> section). <code>libc</code>/<code>windows-sys</code> themselves are pure Rust bindings with no C compilation step, so a scratch crate depending on only those builds cleanly cross-platform even in an environment that can't build the real <code>renderer</code> crate for that target. This proves the code type-checks correctly without proving anything about the rest of the crate -- good enough for "did I get this FFI signature right," not a substitute for testing the whole thing on Linux.</p>
+<h2 id="a-resource-limit-or-sandbox-check-seems-to-pass-but-isn-t-real">A resource-limit or sandbox check seems to pass but isn't real</h2>
+<p><code>setrlimit</code>/<code>SetInformationJobObject</code> returning success does NOT prove the OS is actually enforcing the limit -- some sandboxed/virtualized/containerized environments (including, in one real case during this project's own development, whatever this exact coding environment runs inside) silently accept the call without applying it. The real check reads the limit back from the kernel's own accounting after the fact (<code>/proc/&lt;pid&gt;/limits</code> on Linux). If you get a suspicious result, don't assume it's wrong -- first check whether you raced a process's own exit (see the next entry).</p>
+<h2 id="a-proc-pid-limits-style-check-gives-an-unexpected-result">A <code>/proc/&lt;pid&gt;/limits</code>-style check gives an unexpected result</h2>
+<p>If you spawn a short-lived process, capture its PID, then read <code>/proc/&lt;pid&gt;/...</code> shortly after, there's a real race: if the process has already exited by the time you read it, the PID can have been <strong>reused</strong> by an unrelated, completely different process by the time your read happens, and you'll silently get <em>that</em> process's real (probably unrestricted) limits instead of an error. This actually happened once during this project's own <code>setrlimit</code> verification work -- feeding the renderer's stdin from <code>/dev/null</code> let it hit EOF and exit almost immediately, and a <code>/proc</code> read a moment later picked up a reused PID showing "unlimited." The fix: keep the process alive on purpose while you check it -- feed its stdin from an open pipe (<code>mkfifo</code>, or just don't close the write end) instead of <code>/dev/null</code>, confirm with <code>ps -p &lt;pid&gt;</code> that it's really still your process, then check.</p>
+<h2 id="abyssal-data-or-sync-server-data-appeared-in-your-working-tree"><code>abyssal-data/</code> or <code>sync-server-data/</code> appeared in your working tree</h2>
+<p>Runtime data directories, ignored by <code>.gitignore</code>. Real browser data lives in your OS's standard per-user directory, never in the repository. Never commit either -- <code>abyssal-data/</code> in particular can contain a real recovery code.</p>
+<h2 id="tests-pass-locally-but-a-real-page-renders-blank-or-badly-wrong">Tests pass locally but a real page renders blank or badly wrong</h2>
+<p>Expected for anything JS-framework-heavy -- this rendering engine's CSS/ layout/JS surface is real but deliberately narrow (see <code>02-<em>.md</code> and <code>03-</em>.md</code> for exactly what's covered). Try a plain static HTML page first to confirm the basics work, then check the relevant crate's own module doc for what's explicitly out of scope before assuming it's a bug.</p>
+<h2 id="cargo-audit-fails-in-ci"><code>cargo audit</code> fails in CI</h2>
+<p>Treats any advisory (including "unmaintained"/"yanked" warnings) as an error. Read the actual report: update the flagged dependency if a fix exists, or document and explicitly ignore a specific advisory that has no fix, with a written reason -- never just silence it blind.</p>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>JavaScript Engine - Abyssal Browser Wiki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="topbar">
+  <span class="brand">Abyssal Browser Wiki</span>
+  <span class="subtitle">a personal study guide, not official documentation</span>
+</div>
+<div class="layout">
+  <div class="sidebar">
+    <input type="text" id="filterBox" placeholder="Filter topics...">
+    <ul id="topicList">
+      <li><a href="index.html" data-title="start here">Start Here</a></li>
+      <li><a href="01-process-model-and-ipc.html" data-title="process model & ipc">Process Model &amp; IPC</a></li>
+      <li><a href="02-dom-html-css-layout-render.html" data-title="dom, css, layout & render">DOM, CSS, Layout &amp; Render</a></li>
+      <li class="active"><a href="03-javascript-engine.html" data-title="javascript engine">JavaScript Engine</a></li>
+      <li><a href="04-network-and-privacy.html" data-title="network & privacy">Network &amp; Privacy</a></li>
+      <li><a href="05-account-storage-sync.html" data-title="account, storage & sync">Account, Storage &amp; Sync</a></li>
+      <li><a href="06-app-ui-and-window.html" data-title="app ui & window">App UI &amp; Window</a></li>
+      <li><a href="07-sandboxing.html" data-title="sandboxing">Sandboxing</a></li>
+      <li><a href="08-rust-patterns-glossary.html" data-title="rust patterns glossary">Rust Patterns Glossary</a></li>
+      <li><a href="09-troubleshooting.html" data-title="troubleshooting">Troubleshooting</a></li>
+    </ul>
+  </div>
+  <div class="content">
+    <h1>JavaScript Engine</h1>
+    <p>Everything here lives in <code>renderer/src/script.rs</code>, which is a big file (thousands of lines) but a genuinely coherent one. Read its own top-of-file <code>//!</code> doc comment first -- it's one of the most detailed module docs in the whole codebase and explains several non-obvious design decisions this file goes into more narratively below.</p>
+<h2 id="why-boa">Why Boa</h2>
+<p><a href="https://boajs.dev">Boa</a> is a pure-Rust ECMAScript engine, chosen specifically <em>because</em> it's pure Rust. This process already treats everything about a fetched page as untrusted, attacker-influenced input, and a JS engine is historically the single largest source of real-world browser exploits (V8/JavaScriptCore memory-corruption bugs). A memory-safe engine can't have that class of bug by construction. It can still have logic bugs (an infinite loop, a stack overflow via recursion) -- that's what <code>RuntimeLimits</code> bounds (500,000 loop iterations, 512 recursion depth, both named constants at the top of <code>script.rs</code> -- <code>LOOP_ITERATION_LIMIT</code> and <code>RECURSION_LIMIT</code>, chosen from an actual measured iteration cost, not guessed).</p>
+<h2 id="the-execution-model-no-real-concurrency">The execution model: no real concurrency</h2>
+<p>There is no event loop in the Node.js sense, no threads, no real async I/O. Everything happens either:</p>
+<ol>
+<li>During the <strong>initial script pass</strong> (<code>Session::new_with_shared_storage</code> runs every <code>&lt;script&gt;</code> in document order, then fires <code>'load'</code>), or</li>
+<li>Synchronously, inline, in response to one IPC message: <code>Tick</code> (runs due timers), <code>Click</code> (dispatches a click), <code>TextInput</code>/<code>Focus</code>/<code>Blur</code> (runs <code>input</code>/<code>keydown</code>/<code>change</code> handlers), or <code>EvalConsoleExpression</code> (DevTools).</li>
+</ol>
+<p><code>fetch()</code> is the clearest example of what this means in practice: the actual HTTP request happens <strong>inline</strong>, synchronously, before the native <code>fetch()</code> closure even returns -- through the exact same <code>FilteringFetcher</code> every other request on the tab uses. The result is then wrapped in an already-settled <code>JsPromise</code> (<code>resolve</code>/<code>reject</code>), which is what makes <code>.then()</code>/<code>await</code> on the return value <em>look</em> asynchronous to page script despite there being no real asynchrony underneath at all. Boa's own promise/microtask queue still needs to be drained explicitly -- <code>context.run_jobs()</code> -- after any script execution that might have scheduled a <code>.then()</code> continuation, since <code>Context::eval</code> never does this for you. Miss a <code>run_jobs()</code> call after adding a new entry point and you'll get silently-never-fired <code>.then()</code> callbacks, not a crash -- easy to miss in testing if your test doesn't specifically assert on the callback's effect.</p>
+<h2 id="why-callbacks-live-in-js-state-not-rust-state">Why callbacks live in JS state, not Rust state</h2>
+<p>This is explained at length in <code>script.rs</code>'s own module doc, and it's worth internalizing before you try to add anything that captures a JS function: Boa's garbage collector is a real <strong>tracing</strong> collector (<code>boa_gc::Gc</code>), not simple refcounting. Holding a <code>JsFunction</code> inside a plain Rust struct that Boa's collector doesn't know how to trace is a real use-after-free hazard -- a GC cycle could free a function this process still holds a dangling handle to.</p>
+<p>So every callback (<code>setTimeout</code> callbacks, <code>addEventListener</code> callbacks, both <code>window</code>'s own and per-element ones) lives in a plain JS object reachable from <code>window</code> itself, defined in <code>PRELUDE_JS</code> (a big JS string constant near the top of <code>script.rs</code>, evaluated once per session). The Rust side (<code>HostTimers</code>) only ever tracks numeric timer IDs and <code>std::time::Instant</code>s -- plain data, safe to hold directly, marked <code>unsafe impl Trace</code> with <code>empty_trace!()</code> because there's provably nothing GC-tracked inside.</p>
+<p>If you ever need to capture new Rust state into a native closure, check whether it could ever contain a <code>JsValue</code>/<code>JsObject</code>/<code>JsFunction</code>. If yes, it needs real <code>Trace</code>/<code>Finalize</code> implementations, not <code>empty_trace!()</code>. If you're certain it can't (the existing <code>HostNode</code>/<code>HostTimers</code>/<code>HostConsole</code>/ <code>FetchState</code>/<code>LocalStorageState</code>/<code>IndexedDbState</code> patterns are all "provably no GC pointers inside" -- see each one's own doc comment for why), then <code>empty_trace!()</code> is fine and is the established pattern.</p>
+<h2 id="dom-surface">DOM surface</h2>
+<p><code>build_document_object</code>/<code>build_element_object</code> construct the JS-visible <code>document</code>/element wrappers. <code>document.title</code> (get/set), <code>getElementById</code>/<code>querySelector(All)</code> (real selector engine -- reuses <code>css::matches</code>, not a separate parser), <code>createElement</code>, <code>appendChild</code> (real DOM move semantics -- <code>dom::append_child</code> removes the child from its old parent first), attribute get/set/remove, <code>.textContent</code>, <code>.classList</code>, <code>.value</code> on inputs.</p>
+<p>Every element lookup builds a <strong>fresh JS wrapper object</strong> around the underlying <code>dom::NodeRef</code> -- <code>getElementById('x') === getElementById('x')</code> is <code>false</code> here, unlike a real browser. This is backed by real native data via <code>HostNode</code>'s <code>NativeObject</code> impl (<code>node_from_js_value</code> recovers the underlying <code>dom::NodeRef</code> from any wrapper), which is what makes passing an element between functions (<code>parent.appendChild(child)</code>) work at all despite the lack of identity equality. Event listeners are keyed by <code>dom::NodeId</code> (a stable integer), not by the wrapper object, specifically so this "fresh wrapper every lookup" behavior doesn't break <code>addEventListener</code> across two different lookups of the same real element.</p>
+<h2 id="event-dispatch">Event dispatch</h2>
+<p><code>PRELUDE_JS</code>'s <code>window.__dispatchEvent(chain, type, extraProps)</code> is the real three-phase (capturing → target → bubbling) dispatcher. <code>chain</code> is <code>[targetId, parentId, ..., rootId]</code>, built in Rust (<code>ancestor_chain</code>) from live <code>dom::Node.parent</code> pointers -- NOT from the <code>LayoutBox</code> tree <code>app</code> hit-tested against (that snapshot has no parent links). The dispatcher supports <code>stopPropagation</code>/<code>stopImmediatePropagation</code> but deliberately not <code>preventDefault</code> at the <em>dispatch</em> level (see the module doc for why -- <code>preventDefault</code> is tracked separately, on the <code>Event</code> object, and read back by <code>Session::dispatch_click</code> after dispatch completes, since whether the click's default action fires is <code>app</code>'s decision, not the renderer's).</p>
+<p>Supported real event types: <code>click</code>, <code>keydown</code>, <code>input</code>, <code>submit</code>, and (on <code>window</code>, not via the element-chain dispatcher) <code>storage</code> -- see below. <code>window.__dispatch(type, eventObj)</code> is the simpler mechanism for <code>window</code>-level events with no DOM ancestor chain at all (<code>'load'</code> fires this way with no <code>eventObj</code>; <code>storage</code> fires this way <em>with</em> one).</p>
+<h2 id="localstorage"><code>localStorage</code></h2>
+<p><code>renderer/src/local_storage.rs</code> is the data model (<code>LocalStorageStore</code>, a per-origin <code>HashMap</code> with real quota enforcement -- 5 MiB, <code>MAX_BYTES_PER_ORIGIN</code>). <code>script.rs</code> builds the actual JS-visible object in two layers:</p>
+<ol>
+<li><code>build_local_storage_object</code> builds <code>__nativeLocalStorage</code> -- the real method surface (<code>getItem</code>/<code>setItem</code>/<code>removeItem</code>/<code>clear</code>/<code>key</code>/ <code>.length</code>), registered under an internal name, not <code>localStorage</code> itself.</li>
+<li><code>PRELUDE_JS</code> wraps that in a real Boa <code>Proxy</code> and installs <em>that</em> as <code>window.localStorage</code>/bare <code>localStorage</code>, giving pages real property-style access (<code>localStorage.foo = "bar"</code>) on top of the method surface. The <code>get</code> trap returns <code>undefined</code> for a missing key (real named-property semantics), not <code>getItem</code>'s own <code>null</code> -- a deliberate, documented one-character-of-behavior deviation, chosen because <code>localStorage.foo || fallback</code> behaves identically either way.</li>
+</ol>
+<p><strong>The cross-tab <code>storage</code> event</strong>: <code>set_item</code>/<code>remove_item</code>/<code>clear</code>, after mutating the store, push a <code>StorageChange</code> (origin, key, old value, new value, source URL) onto a shared queue (<code>LocalStorageState::pending_events</code>). <code>RendererState::handle_message</code>'s tail drains this queue (<code>dispatch_pending_storage_events</code>) and, for every OTHER live <code>Session</code> in the same process whose origin matches, calls <code>Session::fire_storage_event</code> -- which evals a small JS snippet that calls <code>window.__dispatch('storage', {...})</code> in <em>that</em> session's own <code>Context</code>. Real, spec-shaped fields, never fired back into the tab that made the change. The one honest caveat: because the IPC protocol is strict lockstep, mutating another tab's session this way doesn't get reflected back to <code>app</code> until that OTHER tab's own next message -- see <code>01-process-model-and- ipc.md</code>.</p>
+<p>Persistence: this crate never writes to disk itself any more. See <code>05-account-storage-sync.md</code> for how <code>app</code> now owns encrypting/writing <code>local_storage.enc</code>.</p>
+<h2 id="indexeddb-renderer-src-indexed-db-rs">IndexedDB (<code>renderer/src/indexed_db.rs</code>)</h2>
+<p>A real but deliberately scoped subset: <code>indexedDB.open</code>/ <code>onupgradeneeded</code>/<code>onsuccess</code>, <code>createObjectStore</code>/<code>deleteObjectStore</code> with real <code>keyPath</code>/<code>autoIncrement</code> (including writing the generated key back into the record when both are set together, matching real spec behavior), <code>transaction</code>/<code>objectStore</code> with <code>put</code>/<code>add</code>/<code>get</code>/<code>getAll</code>/<code>getAllKeys</code>/ <code>delete</code>/<code>clear</code>/<code>count</code>. No indexes, no cursors, no key ranges, no cross-connection <code>versionchange</code> event -- see that module's own doc comment for the exact line.</p>
+<p>The JS-facing layer (<code>INDEXED_DB_PRELUDE_JS</code>, also in <code>script.rs</code>) is worth understanding if you ever touch it, because it uses a real trick: every <code>IDBRequest</code> settles via <code>Promise.resolve().then(...)</code>, never synchronously, even though the underlying <code>__idb*</code> native call it wraps already completed by the time the JS-visible <code>.open()</code>/<code>.put()</code>/etc. call returns. This matters because real <code>IDBRequest</code>s guarantee <code>onsuccess</code>/ <code>onerror</code> never fire before the calling script has had a chance to assign them -- deferring via an already-resolved <code>Promise</code>'s <code>.then()</code> is guaranteed by spec to run as a microtask, never synchronously, so it reproduces that guarantee correctly despite this engine having no real async I/O to wait on.</p>
+<h2 id="runtimelimits"><code>RuntimeLimits</code></h2>
+<p>Set once per <code>Context</code>, in <code>Session::new_with_shared_storage</code>: <code>set_loop_iteration_limit(500_000)</code>, <code>set_recursion_limit(512)</code>. The 500,000 figure isn't arbitrary -- it's derived from a real measured iteration cost (roughly 3.1µs/iteration in the debug build this workspace uses for <code>cargo test</code>, ~115ns/iteration in <code>--release</code>), capping a worst-case runaway script at about 1.6s in debug and ~57ms in release. This bounds <em>script</em>-level runaway loops specifically. It does NOT bound native Rust code doing something pathological outside the JS interpreter -- that's what the per-process <code>setrlimit</code>/Job Object resource caps in <code>renderer::sandbox::resource_limits</code> exist to catch instead (see <code>07-sandboxing.md</code>).</p>
+<h2 id="if-you-re-adding-a-new-native-binding">If you're adding a new native binding</h2>
+<p>The two closure-building patterns you'll see throughout this file:</p>
+<ul>
+<li><code>NativeFunction::from_copy_closure_with_captures(closure, captured_state)</code> -- the common case, for state that's <code>Copy</code> or cheaply <code>Clone</code>-able (an <code>Rc&lt;RefCell&lt;...&gt;&gt;</code>, a small struct of a few fields). Used for almost everything: <code>FetchState</code>, <code>LocalStorageState</code>, <code>IndexedDbState</code>, <code>HostTimers</code>, <code>HostConsole</code>.</li>
+<li><code>unsafe { NativeFunction::from_closure_with_captures(...) }</code> -- used where the captured state includes something like <code>HostNode</code> that needs the <code>unsafe</code> variant for its exact signature; check an existing call site (<code>build_document_object</code>'s <code>title_get</code>/<code>title_set</code>) before reaching for this one blind.</li>
+</ul>
+<p>Whatever you capture, it needs <code>Clone + Finalize + Trace</code> (<code>JsData</code> too, if it's ever stored as native data via <code>ObjectInitializer::with_native_data</code> the way <code>HostNode</code> is). Follow the "does this provably contain zero GC pointers" reasoning above to decide whether <code>empty_trace!()</code> is honestly safe or whether you need a real trace impl.</p>
+  </div>
+</div>
+<script>
+var box = document.getElementById('filterBox');
+box.addEventListener('input', function () {
+  var q = box.value.toLowerCase();
+  var items = document.getElementById('topicList');
+  var links = items.querySelectorAll('a');
+  for (var i = 0; i < links.length; i++) {
+    var link = links[i];
+    var title = link.getAttribute('data-title');
+    if (q === '' || title.indexOf(q) !== -1) {
+      link.classList.remove('hidden');
+    } else {
+      link.classList.add('hidden');
+    }
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "network",
+    "html",
+    "dom",
+    "css",
+    "layout",
+    "render",
+    "privacy",
+    "account",
+    "storage",
+    "sync",
+    "text",
+    "app",
+    "sync-server",
+    "ipc",
+    "renderer",
+]
+
+# Shared dependency versions live here so every crate in the workspace
+# stays in lockstep. Add real deps (reqwest, html5ever, wgpu, etc.) as
+# you flesh out each subsystem — see the comments in each crate's
+# Cargo.toml for suggestions on what to reach for and when.
+[workspace.dependencies]
+dom = { path = "dom" }
+html = { path = "html" }
+css = { path = "css" }
+layout = { path = "layout" }
+render = { path = "render" }
+network = { path = "network" }
+privacy = { path = "privacy" }
+account = { path = "account" }
+storage = { path = "storage" }
+sync = { path = "sync" }
+text = { path = "text" }
+ipc = { path = "ipc" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true

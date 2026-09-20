@@ -1,0 +1,176 @@
+/* Abyssal Browser Wiki stylesheet.
+ *
+ * Deliberately kept within the CSS subset Abyssal Browser's own renderer
+ * supports (see docs/wiki/02-dom-html-css-layout-render.md): id/class/type
+ * selectors, real cascade, flexbox, box model (width/height/border/
+ * padding/margin), position. No font-family (this browser has no
+ * font-family support at all -- one bundled monospace font, always), no
+ * font-weight/font-style reliance for meaning (this browser parses those
+ * properties but has no second font face and no synthetic bold/italic, so
+ * they'd be a silent no-op) -- emphasis is conveyed with color/spacing
+ * instead, which real browsers render on top of anyway.
+ *
+ * This file intentionally works in BOTH Abyssal Browser itself and any
+ * real browser -- it's the lowest common denominator, not a compromise.
+ */
+
+html {
+  background-color: #1b1e24;
+  color: #d8dee9;
+}
+
+body {
+  background-color: #1b1e24;
+  margin: 0;
+  padding: 0;
+}
+
+.topbar {
+  background-color: #11141a;
+  border-bottom: 1px solid #333a46;
+  padding: 12px 20px;
+}
+
+.brand {
+  color: #7aa2f7;
+}
+
+.subtitle {
+  color: #6b7280;
+  padding: 0 0 0 12px;
+}
+
+.layout {
+  display: flex;
+  flex-direction: row;
+}
+
+.sidebar {
+  width: 260px;
+  background-color: #14171d;
+  border-right: 1px solid #333a46;
+  padding: 16px 12px;
+}
+
+#filterBox {
+  width: 220px;
+  height: 26px;
+  border: 1px solid #333a46;
+  background-color: #1b1e24;
+  color: #d8dee9;
+  padding: 4px 8px;
+  margin: 0 0 12px 0;
+}
+
+#topicList {
+  padding: 0;
+  margin: 0;
+}
+
+#topicList li {
+  padding: 6px 8px;
+  margin: 0 0 2px 0;
+  border: 1px solid #1b1e24;
+}
+
+#topicList li.active {
+  background-color: #232833;
+  border: 1px solid #7aa2f7;
+}
+
+#topicList a {
+  color: #d8dee9;
+}
+
+#topicList a.hidden {
+  display: none;
+}
+
+.content {
+  padding: 20px 32px;
+  border: 0;
+}
+
+.content h1 {
+  color: #7aa2f7;
+  border-bottom: 2px solid #333a46;
+  padding: 0 0 8px 0;
+  margin: 0 0 16px 0;
+}
+
+.content h2 {
+  color: #a3be8c;
+  border-bottom: 1px solid #333a46;
+  padding: 0 0 4px 0;
+  margin: 28px 0 12px 0;
+}
+
+.content h3 {
+  color: #ebcb8b;
+  margin: 20px 0 8px 0;
+}
+
+.content p {
+  padding: 0 0 10px 0;
+  margin: 0;
+}
+
+.content code {
+  background-color: #232833;
+  color: #ebcb8b;
+  border: 1px solid #333a46;
+  padding: 0 4px;
+}
+
+.content pre {
+  background-color: #14171d;
+  border: 1px solid #333a46;
+  padding: 12px;
+  margin: 0 0 14px 0;
+}
+
+.content pre code {
+  background-color: #14171d;
+  border: 0;
+  padding: 0;
+  color: #d8dee9;
+}
+
+.content a {
+  color: #7aa2f7;
+}
+
+.content ul {
+  padding: 0 0 10px 24px;
+  margin: 0;
+}
+
+.content ol {
+  padding: 0 0 10px 24px;
+  margin: 0;
+}
+
+.content li {
+  padding: 0 0 6px 0;
+}
+
+.table-wrap {
+  border: 1px solid #333a46;
+  margin: 0 0 14px 0;
+}
+
+table {
+  width: 100%;
+}
+
+th {
+  background-color: #232833;
+  color: #ebcb8b;
+  border: 1px solid #333a46;
+  padding: 6px 8px;
+}
+
+td {
+  border: 1px solid #333a46;
+  padding: 6px 8px;
+}

@@ -1,0 +1,19 @@
+[package]
+name = "privacy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Deliberately dependency-free for now — blocklist matching and
+# header/window normalization are just string/number logic. Reach for
+# these once you outgrow the stub matcher below:
+#   adblock       — Brave's Rust adblock-engine crate; parses real
+#                   EasyList/EasyPrivacy filter syntax instead of the
+#                   flat exact-match list here
+#   publicsuffix  — needed to correctly compute "eTLD+1" for storage
+#                   partitioning (see StoragePartitionKey below) —
+#                   without it, partitioning by "top-level site" is
+#                   wrong for domains like "example.co.uk"
+
+adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+addr = "0.15"

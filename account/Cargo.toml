@@ -1,0 +1,39 @@
+[package]
+name = "account"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Real key derivation: Argon2id (memory-hard, resists GPU/ASIC
+# cracking far better than a fast hash) via `hash_password_into` — the
+# crate's own "key derivation" API, distinct from its PHC-string
+# password-hashing API (which is for storing/verifying login
+# passwords, not deriving encryption keys — see argon2's own docs).
+argon2 = "0.5"
+
+# Real authenticated encryption (AEAD): ChaCha20Poly1305. AEAD matters
+# specifically because it detects tampering — a corrupted or
+# maliciously-modified ciphertext fails to decrypt instead of silently
+# producing garbage plaintext, unlike the old XOR placeholder this
+# replaces.
+chacha20poly1305 = "0.11"
+
+# Real CSPRNG for the KDF salt, the AEAD nonce, and the recovery code
+# itself (the actual secret credential — this one matters far more
+# than the account_id, which just needs to be unique, not
+# unpredictable). Replaces the old `RandomState`-based stand-in, which
+# was explicitly flagged as NOT a real CSPRNG.
+rand = "0.8"
+
+# Array/Key/Nonce construction (chacha20poly1305 0.11's
+# `hybrid-array`-based types): confirmed working via a real build —
+# `TryFrom<&[u8]>` (e.g. `key.as_slice().try_into()`), not the
+# deprecated `Key::from_slice`/`Nonce::from_slice` an earlier version
+# of this file used (same runtime behavior, just the non-deprecated path).
+
+zeroize = "1"
+
+# For the BIP-39 mnemonic checksum (see src/bip39.rs) — the same crate
+# `sync` already uses for its own SHA-256 needs, so this doesn't bring
+# in a new hash implementation to the workspace.
+sha2 = "0.10"

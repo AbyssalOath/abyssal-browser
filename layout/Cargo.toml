@@ -1,0 +1,24 @@
+[package]
+name = "layout"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dom = { workspace = true }
+css = { workspace = true }
+text = { workspace = true }
+
+# `derive` on `LayoutBox` and its plain-data fields (`Rect`,
+# `EdgeSizes`, `TextContent`, `PositionedLine`) — a fully laid-out
+# `LayoutBox` tree is exactly what crosses the `renderer`<->`app`
+# process boundary as JSON (see `ipc`'s module docs): the sandboxed
+# renderer does fetch+parse+style+layout, then hands back a tree
+# that's already pixel-positioned, so `app` only ever needs to paint
+# it, never re-run layout on untrusted content itself.
+serde = { version = "1", features = ["derive"] }
+
+# Block layout math itself needs no extra deps beyond `text` (for
+# word-wrap measurement/line-height). Reach for something like `taffy`
+# only if you decide to delegate flexbox/grid instead of implementing
+# them yourself (a very reasonable choice — flexbox alone is a lot):
+# taffy = "0.4"

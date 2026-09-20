@@ -1,0 +1,15 @@
+[package]
+name = "sync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# This crate intentionally does NOT depend on `account` — it only
+# ever handles opaque bytes (already-encrypted by the caller) and an
+# account_id string to address them by. Keeping that boundary strict
+# is what makes "the server can't read your data" actually true: sync
+# has no way to decrypt even if it wanted to.
+#
+# Real transport once you have a server to talk to:
+reqwest = { version = "0.13", features = ["blocking"] }
+sha2 = "0.10"

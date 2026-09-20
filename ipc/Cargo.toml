@@ -1,0 +1,27 @@
+[package]
+name = "ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+layout = { workspace = true }
+# `dom::NodeId` is a real field of `ClientMessageKind::Click` now (see
+# that variant's doc comment) — no longer test-only.
+dom = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Encodes/decodes a download's raw file bytes as base64 rather than
+# letting serde_json expand a plain `Vec<u8>` into a JSON array of
+# numbers (~4-5x the original size) — see `DownloadSuccess`'s own doc
+# comment for why that expansion matters here specifically (it eats
+# into `MAX_MESSAGE_LEN`'s real headroom). Already a transitive
+# dependency via `reqwest` elsewhere in the workspace.
+base64 = "0.22"
+
+[dev-dependencies]
+# Only used to build a tiny real `LayoutBox` tree in this crate's own
+# tests, to prove a laid-out tree round-trips through the wire format
+# — not needed by the framing/message-type code itself.
+css = { workspace = true }
+text = { workspace = true }

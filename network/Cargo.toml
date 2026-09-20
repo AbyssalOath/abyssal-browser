@@ -1,0 +1,39 @@
+[package]
+name = "network"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+privacy = { workspace = true }
+
+# Real HTTP/1.1+HTTP/2 client. As of reqwest 0.13, the default TLS
+# backend (`default-tls` -> `rustls`) is already rustls, not
+# native-tls/OpenSSL — so no system TLS library dependency, matching
+# this project's "memory-safe Rust" preference. `blocking` gives a
+# synchronous client, matching this crate's synchronous `Fetcher`
+# trait (no async runtime threaded through the rest of the app).
+reqwest = { version = "0.13", features = ["blocking"] }
+
+# For parsing the DNS-over-HTTPS JSON response (see HttpFetcher::resolve_via_doh).
+# serde_json's Value/from_str API has been stable across the entire 1.x
+# line for years — skipping the usual crates.io version-pinning
+# diligence this project does for newer/smaller dependencies (see
+# html5ever, wgpu, reqwest itself) is a deliberate exception here, not
+# an oversight.
+serde_json = "1"
+
+# For hashing a (partition key, URL) pair into a cache filename (see
+# `DiskCache::path_for`) — the same crate `sync`/`account` already use
+# for their own hashing needs, so this doesn't add a new primitive to
+# the workspace.
+sha2 = "0.10"
+
+# Real `file://` URL -> filesystem path parsing (percent-decoding,
+# correct handling of `file:///abs/path` vs. the rarer `file://host/path`
+# form) for `FilteringFetcher`'s opt-in local-file support — see
+# `local_file_path`'s own doc comment. Already a transitive dependency
+# via `reqwest`; this just makes the edge direct. Real URL parsing here
+# instead of hand-rolling, unlike `extract_host`/`extract_path` above
+# (which only need "good enough to key a hashmap" — file paths need to
+# be exactly right, not approximate).
+url = "2"

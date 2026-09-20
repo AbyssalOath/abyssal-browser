@@ -1,0 +1,98 @@
+[package]
+name = "abyssal"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "abyssal"
+path = "src/main.rs"
+
+[dependencies]
+dom = { workspace = true }
+html = { workspace = true }
+css = { workspace = true }
+layout = { workspace = true }
+render = { workspace = true }
+privacy = { workspace = true }
+account = { workspace = true }
+storage = { workspace = true }
+sync = { workspace = true }
+text = { workspace = true }
+# NOT `network` — real fetching now happens exclusively in the
+# sandboxed `renderer` child process (see `ipc`'s module docs for why);
+# this process never links the code that makes outbound requests or
+# touches raw response bytes at all.
+ipc = { workspace = true }
+
+# Real, spec-correct relative-URL resolution (`resolve_url`) — pure
+# parsing, no I/O, so depending on it directly here doesn't touch the
+# "app never does real fetching" boundary at all. Already a transitive
+# dependency via `reqwest` elsewhere in the workspace, so this adds no
+# new supply-chain surface, just a direct dependency edge on code
+# that's already vetted and compiled.
+url = "2"
+
+
+# Serializes/deserializes the local (unsynced — see `DownloadRecord`'s
+# own doc comment) download-history file. Pure data (de)serialization,
+# no I/O of its own, and already a transitive dependency via `ipc`'s
+# own message types — this just makes the edge direct for `app`'s own
+# use of it.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# `Zeroizing<[u8; 32]>` — the exact type `account::derive_key` returns.
+# `RendererProcess` holds one clone of it for the whole session (see
+# its own doc comment on why: cookies/`localStorage`/IndexedDB persist
+# far more often than bookmarks, and re-deriving the deliberately-slow
+# Argon2id key on every single one would stall the UI). Already a
+# transitive dependency via `account` itself; this just makes the edge
+# direct so this crate can name the type on a struct field.
+zeroize = "1"
+
+# Real audio OUTPUT for `<audio>`/`<video>` playback — see
+# `media_playback.rs`'s own module docs. `app` (not the sandboxed
+# `renderer`) owns this: decoding untrusted audio bytes happens over in
+# `renderer::media` (a real, sandboxed process — see that module's own
+# docs on why), but the OS-level audio device itself is opened here,
+# from already-decoded, no-longer-untrusted PCM samples. cpal is a thin
+# cross-platform binding to the OS's own audio APIs (CoreAudio/WASAPI/
+# ALSA), the same category of dependency `wgpu` already is for this
+# crate's real GPU/window access.
+cpal = "0.15"
+
+# Decodes the bundled window icon (see `load_window_icon` in
+# src/main.rs) — the SAME crate (and version) `renderer` already uses
+# to decode a page's own `<img>` bytes, just a direct dependency here
+# too now. Trusted, compile-time-embedded asset only: this process
+# never decodes anything network-fetched or otherwise untrusted with
+# it (that stays exclusively `renderer`'s job, in its sandbox — see
+# that crate's own module docs). PNG-only, no default features, same
+# minimal-feature-set reasoning `renderer`'s own `image` dependency
+# already documents.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Once `render` grows a real window surface (wgpu) instead of an
+# in-memory buffer, this crate is also where you'd add windowing:
+# winit = "0.29"
+
+# Builds the real accessible tree `render::window` hands to
+# `accesskit_winit` — see `render`'s own Cargo.toml for why this exact
+# version is pinned (matching `accesskit_winit`'s own dependency, so
+# the `accesskit::TreeUpdate`/`Node`/`Role` types this crate builds are
+# the SAME types `render::window`'s adapter expects, not a second,
+# incompatible copy). A plain data-description crate (no I/O, no
+# rendering of its own) — building this tree from `layout::LayoutBox`
+# is architecturally the same kind of step as `render::paint` itself,
+# just describing structure/semantics for an assistive technology
+# instead of pixels.
+accesskit = "=0.12.3"
+
+# Embeds `assets/icon.ico` as this binary's real native icon resource
+# on Windows ONLY — see build.rs's own module doc comment for the full
+# story. A `target.'cfg(windows)'` dependency (not a plain one): this
+# crate, and the real MSVC/MinGW resource-compiler invocation it does,
+# has nothing to do at all on Linux/macOS, so it's not even pulled in
+# as a dependency there.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
