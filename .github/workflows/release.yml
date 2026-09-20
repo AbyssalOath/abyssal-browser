@@ -31,12 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (winit/wgpu link deps)
+      - name: Install system dependencies (winit/wgpu/cpal link deps)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libx11-dev libxkbcommon-dev libwayland-dev pkg-config \
-            libgl1-mesa-dev
+            libgl1-mesa-dev libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -112,8 +112,30 @@ jobs:
           fi
           echo "Windows icon embedded successfully."
 
+      # `--test-threads=1`: this job's first real run crashed partway
+      # through with a native STATUS_ACCESS_VIOLATION (0xc0000005) on
+      # this exact step, with no specific failing test named -- the
+      # process just died. The surrounding tests that DID complete are
+      # a mix of ones that spawn a real `abyssal-renderer.exe`
+      # subprocess and ones that open a real `cpal`/WASAPI audio stream
+      # (see `app::media_playback`), both real OS resources `cargo
+      # test`'s default multi-threaded runner exercises CONCURRENTLY
+      # across many tests at once -- a plausible, but not yet actually
+      # diagnosed, root cause on a platform this project has never had
+      # real hardware to test on before (see `THREAT_MODEL.md`'s
+      # renderer-sandbox section for the matching, pre-existing "real
+      # code, unverified on Windows" caveat). Serializing the test run
+      # is a real mitigation for a concurrency-shaped crash like this,
+      # not a workaround that hides a deterministic failure -- but it
+      # is UNVERIFIED against the actual crash, since reproducing it
+      # needs a real Windows machine this project's own development
+      # loop does not have. If this step crashes again even serialized,
+      # that rules out concurrency and points at a specific test
+      # instead -- see this project's own `THREAT_MODEL.md` "Priority
+      # list for an external audit" for the standing "get real Windows
+      # hardware into this project's dev loop" item this belongs under.
       - name: Run test suite against release build
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release -- --test-threads=1
 
       - name: Stage release artifacts
         shell: bash
@@ -155,6 +177,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # `abyssal`'s own test suite spawns a REAL `abyssal-renderer`
+      # subprocess (see `app::renderer_binary_path`), found next to the
+      # test binary's own executable -- but `cargo test` alone never
+      # places a plainly-named `abyssal-renderer` (or `.exe`) at
+      # `target/release/`, only a hashed copy under `target/release/
+      # deps/` alongside its own test harness binary. An explicit
+      # `cargo build` first (same as `build-linux`'s and `build-
+      # windows`'s own steps) is what actually produces that plain,
+      # discoverable binary before any test tries to spawn it.
+      - name: Build abyssal + abyssal-renderer (release)
+        run: cargo build --workspace --release
 
       - name: Run test suite against release build
         run: cargo test --workspace --release

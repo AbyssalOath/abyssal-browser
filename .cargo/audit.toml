@@ -1,0 +1,31 @@
+# cargo-audit config. CI runs `cargo audit --deny warnings`, so every
+# advisory below is denied unless explicitly ignored here.
+#
+# The four IDs ignored below are all "unmaintained crate" warnings (not
+# vulnerabilities) for transitive dependencies this project doesn't
+# control directly, confirmed via `cargo update -p <crate> --dry-run`
+# to have no newer or alternative version available at all within the
+# current dependency tree:
+#
+# - derivative (RUSTSEC-2024-0388) and paste (RUSTSEC-2024-0436): pulled
+#   in by accesskit's Linux AT-SPI stack (zbus) and boa_engine
+#   respectively.
+# - instant (RUSTSEC-2024-0384): a transitive dependency somewhere in
+#   the windowing/GPU stack.
+# - ttf-parser (RUSTSEC-2026-0192): pulled in (in two different
+#   versions) by the font-handling stack.
+#
+# This ignore list is deliberately narrow -- it does NOT ignore
+# anything by crate name, only these four specific advisory IDs, so a
+# real, newly-disclosed vulnerability in any of these crates (or
+# anything else in the tree) still fails CI. Revisit this list, and
+# actually replace/remove the offending dependency where one becomes
+# available, before this project's own 1.0 release -- see
+# `THREAT_MODEL.md`'s "Dependencies and supply chain" section.
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0388", # derivative: unmaintained, no fix available
+    "RUSTSEC-2024-0384", # instant: unmaintained, no fix available
+    "RUSTSEC-2024-0436", # paste: unmaintained, no fix available
+    "RUSTSEC-2026-0192", # ttf-parser: unmaintained, no fix available
+]

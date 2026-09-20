@@ -136,6 +136,21 @@ What this does **not** cover:
   network restriction at all yet, just process-level hardening. Treat both as
   a real reduction in attack surface, not as tested-and-proven the way Linux's
   is, until someone actually runs this on the real OS.
+  **Update**: real GitHub-hosted macOS and Windows CI runners now build this
+  project and run its test suite on every push, which is a real step past
+  "cross-type-checked only" -- the Windows sandbox itself was confirmed to
+  actually apply (`abyssal-renderer`'s own log lines confirm the Job Object
+  and mitigation policies are accepted at runtime, not just compiling), and
+  macOS built and passed cleanly. This is still not the same as someone
+  actually using the browser day to day on either OS, and a separate, real,
+  unresolved issue turned up on that same Windows CI run: `app`'s own test
+  suite hit a native `STATUS_ACCESS_VIOLATION` crash under `cargo test`'s
+  default multi-threaded execution, with no specific test identified as the
+  cause. Mitigated in CI by serializing that platform's test run
+  (`--test-threads=1` -- see `.github/workflows/release.yml`'s own comment
+  on this), which is a real fix for a concurrency-shaped crash but an
+  UNVERIFIED one, since diagnosing it further needs real Windows hardware
+  this project's development loop still does not have.
 - **Resource limits.** `sandbox::resource_limits` (Linux/macOS, via real
   `setrlimit(RLIMIT_AS)`/`setrlimit(RLIMIT_CPU)` calls, empirically verified
   on real Linux hardware to actually be enforced - `/proc/<pid>/limits` on a

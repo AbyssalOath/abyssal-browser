@@ -185,7 +185,24 @@ by area rather than by date.
   push and pull request against Linux, and a tag-driven release workflow that
   builds and tests natively on four runners (Linux x86_64, Windows x86_64,
   and macOS Intel and Apple Silicon) and publishes one archive per platform
-  to a single GitHub pre-release.
+  to a single GitHub pre-release. Fixed on this project's first real CI run:
+  Linux jobs were missing `libasound2-dev` (needed by `cpal`/`alsa-sys`,
+  added alongside the existing winit/wgpu system packages); the macOS release
+  job ran `cargo test --release` with no preceding `cargo build --release`,
+  so `abyssal`'s own test suite couldn't find a plainly-named
+  `abyssal-renderer` binary to spawn (only a hashed one under
+  `target/release/deps/`); `cargo audit` was failing on newly-disclosed
+  advisories in `h2`, `quick-xml`, `rustls`, and a yanked `chacha20` release,
+  all fixed by `cargo update`, plus four already-latest, genuinely
+  unmaintained transitive dependencies (`derivative`, `instant`, `paste`,
+  `ttf-parser`) with no available fix, narrowly ignored by advisory ID in
+  `.cargo/audit.toml` (not by crate name, so a real future vulnerability in
+  any of them still fails CI) rather than silently disabled; and the Windows
+  release job hit a real, still only partially understood native crash
+  (`STATUS_ACCESS_VIOLATION`) under the test suite's default parallelism,
+  mitigated (not yet root-caused) by serializing that platform's test run.
+  See `THREAT_MODEL.md`'s renderer-sandbox section for the full, honest
+  writeup of that last one.
 - Documentation: `README.md`, `ARCHITECTURE.md`, `THREAT_MODEL.md`,
   `SECURITY.md`, `TESTING.md`, `CONTRIBUTING.md`, and this changelog.
 - Licensed the project's own code under the GNU Affero General Public
