@@ -112,22 +112,24 @@ jobs:
           fi
           echo "Windows icon embedded successfully."
 
-      # This job's first real run crashed with a native
-      # STATUS_ACCESS_VIOLATION (0xc0000005) inside
-      # `app::media_playback`'s real `cpal`/WASAPI stream-opening
-      # tests. Serializing the run (`--test-threads=1`) as a first
-      # guess at a concurrency-shaped cause did NOT fix it -- the same
-      # test crashed again, deterministically, proving it was never
-      # about concurrency at all. The real cause: this headless runner
-      # has no real audio hardware, and unlike a clean `cpal::Error`
-      # (which those tests already handle gracefully), a raw FFI crash
-      # inside `cpal`'s own WASAPI backend bypasses Rust's
-      # `Result`/panic machinery entirely -- nothing on this side of
-      # the FFI boundary can catch it. Those two tests are now
-      # `#[ignore]`d (see their own doc comments in
-      # `app/src/media_playback.rs`) rather than worked around here.
+      # This job's runs so far have hit TWO separate native
+      # STATUS_ACCESS_VIOLATION (0xc0000005) crashes. The first was
+      # diagnosed and fixed (`app::media_playback`'s real `cpal`/WASAPI
+      # stream-opening tests, now `#[ignore]`d -- see their own doc
+      # comments). A SECOND, still-undiagnosed one showed up once that
+      # was fixed. Under this crate's default parallel + captured test
+      # execution, a test that gets killed by a crash never flushes its
+      # own buffered output, so the log names no specific test at all --
+      # `--test-threads=1` is reinstated here PURELY as a diagnostic:
+      # with tests serialized, the harness prints each test's name
+      # BEFORE running it, so whichever name is left dangling with no
+      # "ok"/"FAILED" after it in the next failing run's log is the
+      # actual culprit (this is exactly how the first crash was
+      # identified). Once that test is identified, replace this
+      # comment and the flag with a real, targeted fix rather than
+      # leaving the whole suite permanently serialized.
       - name: Run test suite against release build
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release -- --test-threads=1
 
       - name: Stage release artifacts
         shell: bash

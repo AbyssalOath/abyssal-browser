@@ -6747,16 +6747,33 @@ mod tests {
 
     #[test]
     fn render_downloads_html_links_the_saved_path_as_a_real_file_url() {
+        // `std::env::temp_dir()` rather than a hardcoded `/tmp/...`
+        // literal: a real, OS-native ABSOLUTE path on every platform
+        // this project targets, including Windows, where `/tmp/...`
+        // is not absolute at all (no drive letter) and
+        // `url::Url::from_file_path` correctly refuses it -- which is
+        // exactly the real-world bug a hardcoded Unix path would have
+        // hidden from this very test (it did, until this ran on real
+        // Windows CI: see `THREAT_MODEL.md`'s renderer-sandbox
+        // section).
+        let saved_path = std::env::temp_dir().join("abyssal-test-report.pdf");
+        let expected_href = url::Url::from_file_path(&saved_path)
+            .expect("a real OS temp dir is always a valid absolute path")
+            .to_string();
         let downloads = vec![DownloadRecord {
             url: "https://example.com/report.pdf".to_string(),
             filename: "report.pdf".to_string(),
-            saved_path: std::path::PathBuf::from("/tmp/report.pdf"),
+            saved_path: saved_path.clone(),
             downloaded_at_unix: 100,
             size_bytes: 1024,
         }];
         let html = render_downloads_html(&downloads);
+        let expected = format!(
+            "<a href=\"{expected_href}\">{}</a>",
+            html_escape(&saved_path.display().to_string())
+        );
         assert!(
-            html.contains("<a href=\"file:///tmp/report.pdf\">/tmp/report.pdf</a>"),
+            html.contains(&expected),
             "expected a real clickable file:// link to the saved path, got: {html}"
         );
     }
