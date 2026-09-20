@@ -28,6 +28,28 @@ by area rather than by date.
   lockstep replies, and per-tab scoping (`ipc`).
 - Site isolation: `RendererPool` runs one renderer process per eTLD+1 and
   spawns and reaps them on demand. Same-site tabs share a process.
+- Asynchronous page navigation: each `RendererProcess` now owns a dedicated
+  background thread that does the actual blocking pipe I/O (write the request,
+  block on the reply), so a real page load's own multi-second round trip no
+  longer freezes the single UI/event-loop thread -- and every OTHER open tab
+  (on its own, independent process and thread) along with it. `begin_navigate`/
+  `poll_pending_navigations` fire a `Navigate` and return immediately, applying
+  the real result once it arrives via a new `render::window::WakeHandle`
+  (reuses the same `EventLoopProxy` mechanism already wired up for AccessKit's
+  own action-request bridge) that wakes the window's event loop the moment a
+  background reply lands, instead of waiting for the next real input or
+  scheduled timer. Every other message kind (click, focus, text input, tick,
+  ...) still blocks its own caller for as long as its own round trip takes --
+  a deliberate, disclosed scope decision, since none of those do real network
+  I/O or run script long enough (`RuntimeLimits` bounds it) to have been the
+  actual source of the freeze this fixes. Caught and fixed a real bug during
+  development: `evict_unreferenced_renderer_processes` didn't know a tab's
+  in-flight `pending_navigation` also counts as "referencing" its (possibly
+  brand new) site's process, so an unrelated tab's own navigation completing
+  could evict and kill a DIFFERENT tab's still-in-flight renderer process out
+  from under it, hanging that navigation forever -- caught by a real,
+  multi-tab, real-network test (`a_slow_navigation_does_not_block_the_caller_
+  or_other_tabs`, using `https://httpbin.org/delay/3`) before it ever shipped.
 - Linux renderer sandbox: Landlock (filesystem plus TCP port restrictions) and a
   seccomp-bpf syscall allowlist (about 55 syscalls) derived empirically from a
   traced workload.
@@ -273,6 +295,15 @@ by area rather than by date.
 - The cross-tab `storage` event can leave another tab's rendered view stale
   until that tab's own next message, a real consequence of the strict
   lockstep IPC protocol - see `ARCHITECTURE.md`.
+- Async page navigation's failure handling is narrower than every OTHER
+  message kind's: a broken pipe mid-navigation reports a normal "Failed to
+  load" page rather than the one automatic respawn-and-retry `click`/`focus`/
+  `text input`/etc. still get (see `Browser::poll_pending_navigations`'s own
+  doc comment for why). `<a download>` links and background tab content
+  behind a resize both keep their own pre-existing, separate limitations too
+  (downloads are still a fully synchronous fetch; a background tab's layout
+  isn't re-run for a resize that happened while it wasn't active, the same
+  way it wasn't before this change either).
 - No iframes, WebRTC, Canvas/WebGL, `<textarea>`, `multipart/form-data`
   (file upload) forms, `<picture>`/`srcset`, ARIA, or `font-family` support.
   Many modern JavaScript-heavy sites will render empty or broken.

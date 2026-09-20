@@ -107,13 +107,19 @@ pub const MAX_MESSAGE_LEN: u32 = 64 * 1024 * 1024;
 pub struct TabId(pub u64);
 
 /// One message from `app` to the renderer, always scoped to a tab.
-#[derive(Debug, Serialize, serde::Deserialize)]
+///
+/// `Clone` exists for `app::RendererProcess`'s own threaded I/O
+/// worker: queuing a message onto that worker's channel needs an
+/// OWNED copy (the worker runs on a separate thread from whatever
+/// built this), and a `send_with_respawn`-style retry after a broken
+/// pipe needs to queue the exact same message a second time.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ClientMessage {
     pub tab_id: TabId,
     pub kind: ClientMessageKind,
 }
 
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub enum ClientMessageKind {
     /// Navigate this tab to a new page, discarding whatever it was
     /// showing before (and whatever `script::Session` state — pending
@@ -661,7 +667,7 @@ pub enum ServerMessageKind {
 
 /// What `app` asks the renderer to do: fetch `url` and hand back a
 /// fully laid-out page (or an error).
-#[derive(Debug, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct RenderRequest {
     pub url: String,
     /// `Some(bytes)` for a POST form submission — `bytes` is the

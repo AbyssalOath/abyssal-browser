@@ -1726,7 +1726,7 @@ const NEVER_RENDERED_TAGS: &[&str] = &[
 /// not to need a dedicated value yet.
 const INLINE_TAGS: &[&str] = &[
     "a", "span", "b", "i", "em", "strong", "small", "code", "label", "abbr", "sub", "sup", "u",
-    "s", "mark", "img", "input", "video", "audio",
+    "s", "mark", "img", "input", "video", "audio", "button",
 ];
 
 /// The browser's default stylesheet — applied before any page CSS, so
@@ -1784,6 +1784,28 @@ pub fn user_agent_stylesheet(theme: Theme) -> Stylesheet {
     css_text.push_str(
         r#" input[type="checkbox"], input[type="radio"] { width: 16px; height: 16px; padding: 0; }"#,
     );
+
+    // A `<button>` (and a submit-shaped `<input>`) is a form control
+    // exactly like a text `<input>` above, and gets the SAME visible
+    // border/background box for the same reason: with no UA rule at
+    // all, a button rendered as bare, unstyled text is indistinguishable
+    // from a plain paragraph -- no visual affordance that it's
+    // clickable at all, which is a real usability regression from every
+    // mainstream browser's own default `<button>` chrome. Reuses the
+    // exact same `input_background_hex`/`input_border_hex` colors
+    // rather than inventing a separate "button chrome" pair this
+    // project's theme system doesn't have -- one consistent "this is a
+    // control" visual language, the same way the checkbox/radio rule
+    // above only overrides size, not color, from the base `input` rule.
+    // `width`/`height` are deliberately NOT set here (unlike the fixed
+    // 150x22 text-input box above) -- a button's natural size should
+    // fit its own label text, the same way `layout`'s ordinary
+    // shrink-to-fit inline sizing already handles for any other inline
+    // element; only `border`/`background-color`/`color`/`padding` need
+    // a UA-level default at all.
+    css_text.push_str(&format!(
+        r#" button, input[type="submit"], input[type="button"], input[type="reset"] {{ width: auto; height: auto; border: 1px solid {input_border}; background-color: {input_bg}; color: {fg}; padding: 4px 10px; }}"#
+    ));
 
     // `<audio>` without `controls` is invisible per real HTML semantics
     // (a page is expected to control it entirely via script, which
@@ -2092,6 +2114,41 @@ mod tests {
         assert_eq!(
             style.properties.get("background-color").map(String::as_str),
             Some(Theme::Dark.input_background_hex())
+        );
+    }
+
+    #[test]
+    fn a_button_gets_a_real_visible_box_sized_to_its_own_content() {
+        let sheet = user_agent_stylesheet(Theme::Dark);
+        let document = dom::Node::new_document();
+        let button = dom::Node::new_element("button");
+        dom::append_child(&document, button.clone());
+
+        let style = compute_style(&button, &sheet, None);
+        assert_eq!(
+            style.display(),
+            Display::Inline,
+            "a button should sit alongside surrounding text/other buttons, not force its own line"
+        );
+        assert!(
+            style.properties.contains_key("border"),
+            "a button with no author CSS must still get a visible box -- \
+             otherwise it's indistinguishable from plain text"
+        );
+        assert_eq!(
+            style.properties.get("background-color").map(String::as_str),
+            Some(Theme::Dark.input_background_hex())
+        );
+        // Unlike a fixed-size text `<input>`, a button must size to its
+        // own label -- `auto` here is what cancels any fixed box a less
+        // specific rule might otherwise imply.
+        assert_eq!(
+            style.properties.get("width").map(String::as_str),
+            Some("auto")
+        );
+        assert_eq!(
+            style.properties.get("height").map(String::as_str),
+            Some("auto")
         );
     }
 

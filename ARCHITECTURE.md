@@ -162,6 +162,22 @@ real ancestor chain to dispatch capture, target, and bubble phases. `app`
 dispatches the click first and only follows a link if nothing called
 `preventDefault()`.
 
+Step 3's request (`Navigate` specifically) does not block `app`'s own single
+UI/event-loop thread while steps 4-9 run on the renderer. Each `RendererProcess`
+owns a dedicated background thread that does the actual blocking pipe write/read
+(see `run_renderer_io`); `Browser::begin_navigate*` queues the request and
+returns immediately, and `Browser::poll_pending_navigations` applies the real
+result once it arrives, woken up promptly by a `render::window::WakeHandle`
+call from that background thread rather than waiting for the next real input
+or scheduled timer. This is what stops one tab's slow page load from freezing
+every other open tab (each on its own independent process and thread) and the
+window itself. Every OTHER message kind (`Click`, `Focus`, `TextInput`,
+`Tick`, ...) still blocks its OWN caller for as long as its own round trip
+takes -- a deliberate scope decision, since none of those run untrusted script
+long enough (`RuntimeLimits` bounds it) or do real network I/O of their own to
+have been an actual source of a multi-second stall the way a real page fetch
+is.
+
 ## The IPC protocol
 
 Defined in the `ipc` crate.
@@ -235,9 +251,15 @@ doesn't cover, and [`THREAT_MODEL.md`](THREAT_MODEL.md) for the honest caveat.
 
 `app`'s `RendererPool` (in `app/src/main.rs`) keeps one renderer process per
 distinct site that any open tab is showing. Processes are spawned on first need
-and killed when no tab references them any more. Tabs on the same site share a
-process on purpose, since splitting them adds overhead with no isolation
-benefit.
+and killed when no tab references them any more -- "references" means either a
+tab's own `renderer_site` (its live, already-loaded session) OR a tab's own
+`pending_navigation` (an async `Navigate` still in flight, whose reply hasn't
+updated `renderer_site` yet -- see `Life of a page load`'s own note on
+asynchronous navigation). Missing that second case was a real bug during
+development: an unrelated tab's navigation completing could evict and kill a
+DIFFERENT tab's brand new, still-in-flight process before its own reply ever
+arrived. Tabs on the same site share a process on purpose, since splitting
+them adds overhead with no isolation benefit.
 
 Limits: there are no cross-process iframe boundaries because iframes are not
 rendered at all, and the disk cache directory is shared by every renderer

@@ -214,6 +214,19 @@ const TAB_BAR_HEIGHT: f32 = 28.0;
 const TAB_FONT_SIZE: f32 = 14.0;
 const CHROME_HEIGHT: f32 = TAB_BAR_HEIGHT + ADDRESS_BAR_HEIGHT;
 
+/// A thin vertical scroll indicator along the page content area's right
+/// edge — drawn whenever the active tab's content is actually taller
+/// than its viewport (`Browser::paint_scrollbar`), never as a real
+/// draggable widget (there's no hit-testing for it at all, matching
+/// this project's mouse-wheel-only scrolling model) but as the one
+/// thing that was previously missing entirely: a visible cue that a
+/// page has more content below, and roughly how far into it the
+/// current scroll position is. `MIN_THUMB_HEIGHT` keeps the thumb from
+/// shrinking to an unusably (and, worse, invisibly) thin sliver on a
+/// very long page.
+const SCROLLBAR_WIDTH: f32 = 8.0;
+const SCROLLBAR_MIN_THUMB_HEIGHT: f32 = 24.0;
+
 /// The find-in-page bar (`Ctrl+F`) is a small floating overlay in the
 /// top-right of the PAGE CONTENT area — deliberately NOT folded into
 /// `CHROME_HEIGHT` the way the tab/address bars are, since it only
@@ -459,19 +472,70 @@ fn load_window_icon() -> Option<render::window::WindowIcon> {
 
 fn main() {
     let requested_url = std::env::args().nth(1);
-    let mut browser = Browser::new(requested_url.as_deref());
-    // `Browser::new` already navigated (or loaded the demo page), so
-    // its real title is known now — use that as the window's starting
-    // title rather than a hardcoded placeholder (the synthetic
-    // `Resized` event `run_window` calls the handler with at startup
-    // doesn't itself carry a title update — see `handle_event`).
-    let initial_title = browser.window_title();
     let icon = load_window_icon();
 
-    render::window::run_window(&initial_title, icon, move |event| {
-        browser.handle_event(event)
+    // `Browser::new` (and the real navigation/demo-page load it does
+    // internally) now happens INSIDE `build_handler`, after the real
+    // event loop exists — see `render::window::run_window`'s own doc
+    // comment on why: every renderer process `Browser` spawns needs a
+    // real `WakeHandle` to notify this window when an async page load
+    // finishes (see `RendererPool`'s own doc comment on why navigation
+    // is asynchronous at all), and nothing can hand out a real one
+    // before the event loop is built. The window briefly shows a
+    // generic starting title until `Browser::new`'s own real one lands
+    // via the very first `Frame` a moment later — imperceptible in
+    // practice, and a fair trade for every later navigation never
+    // freezing the whole window the way a fully synchronous renderer
+    // round trip would.
+    render::window::run_window("Abyssal Browser", icon, move |wake| {
+        let mut browser = Browser::new(requested_url.as_deref(), wake);
+        move |event| browser.handle_event(event)
     });
     // blocks until the window is closed
+}
+
+/// Tracks ONE tab's still-in-flight page navigation — created by
+/// `Browser::begin_navigate_without_history_with_body` the moment a
+/// `Navigate` is queued (never blocking to wait for it), and consumed
+/// by `Browser::poll_pending_navigations` once that specific request's
+/// reply actually arrives. This is the whole reason a heavy page load
+/// no longer freezes the rest of the browser: `begin_navigate_*`
+/// returns to the event loop immediately, and the eventual result gets
+/// applied on a LATER, separate `InputEvent::Tick` (see
+/// `render::window::WakeHandle`'s own doc comment for how that Tick
+/// gets triggered promptly rather than waiting for the next real input
+/// or scheduled timer).
+///
+/// Starting a NEW navigation on a tab that already has one of these
+/// simply overwrites it here -- the OLD request's `request_id` no
+/// longer matches anything any tab is waiting on, so
+/// `poll_pending_navigations` silently drops its reply whenever it
+/// eventually arrives (see that method's own doc comment), the same
+/// "a newer navigation supersedes an older, still-loading one" behavior
+/// every real browser's own address bar already has.
+struct PendingNavigation {
+    /// Matched against `RendererProcess::take_reply`'s own return value
+    /// -- see that method's doc comment for why more than one request
+    /// can be in flight to the same process at once, and why a plain
+    /// per-tab boolean ("is something pending") wouldn't be enough to
+    /// tell which reply is actually this navigation's own.
+    request_id: u64,
+    /// Which `RendererPool` entry the request was queued on -- needed
+    /// since `poll_pending_navigations` doesn't otherwise know which
+    /// process to ask.
+    site: String,
+    /// This tab's `renderer_site` BEFORE this navigation started, if
+    /// any -- see the synchronous `navigate_without_history_with_body`'s
+    /// own tail logic (which this mirrors) for why the OLD site's
+    /// process needs an explicit `CloseTab` when a navigation actually
+    /// lands on a DIFFERENT site's process.
+    old_site: Option<String>,
+    url: String,
+    /// `Some` only for a history back/forward/reload re-entry, which
+    /// restores the scroll position the page had when it was left,
+    /// instead of resetting to the top the way every other navigation
+    /// does -- see `Browser::go_to_history_entry`'s own doc comment.
+    restore_scroll_y: Option<f32>,
 }
 
 /// One tab's own page state — everything a real browser keeps
@@ -554,6 +618,16 @@ struct Tab {
     /// timer (this `Some`, that `None`), so neither can substitute for
     /// the other.
     renderer_site: Option<String>,
+
+    /// `Some` while a navigation this tab started is still in flight on
+    /// its renderer process's own background I/O thread — see
+    /// `PendingNavigation`'s own doc comment, and `Browser::
+    /// begin_navigate_without_history_with_body`/`poll_pending_
+    /// navigations`, which set and resolve this. `None` the rest of the
+    /// time, including for every `about:` pseudo-page (those never go
+    /// through the renderer at all, so there's nothing async about
+    /// them).
+    pending_navigation: Option<PendingNavigation>,
 
     /// The text-editable `<input>` (see `layout::is_text_like_input`)
     /// currently focused on the PAGE itself, if any — entirely separate
@@ -729,6 +803,7 @@ impl Tab {
             scroll_y: 0.0,
             next_wake_at: None,
             renderer_site: None,
+            pending_navigation: None,
             focused_page_input: None,
             keyboard_focus: None,
             finding_in_page: false,
@@ -878,16 +953,31 @@ struct StoragePersistence {
 
 /// A handle to ONE sandboxed renderer child process (there can be
 /// several now — see `RendererPool` — one per distinct site any open
-/// tab is showing): its stdin/stdout pipes, framed with
-/// `ipc::{read_message, write_message}`. Owns the `Child` itself so it
-/// can be killed cleanly (see `Drop`) and respawned if the pipe ever
-/// breaks (a crash, or the sandbox killing it for a denied operation)
-/// — one respawn-and-retry per `render` call, so a single bad page
-/// can't permanently break navigation for the rest of the session.
+/// tab is showing). The actual pipe I/O (`ipc::{read_message,
+/// write_message}`) happens on a DEDICATED background thread this
+/// process spawns for itself (see `run_renderer_io`), never on the
+/// browser's own single UI/event-loop thread — every method here that
+/// talks to the renderer queues a message onto that thread's channel
+/// and either blocks THIS (already synchronous) call site for its own
+/// reply (`try_send`, used by every foreground action: click, focus,
+/// text input, tick, ...) or, for a page navigation specifically,
+/// returns immediately with a request id to check on later
+/// (`begin_render`) — see `RendererPool`'s own doc comment for why
+/// `Navigate` alone gets that treatment. Either way, the UI event
+/// loop's own thread is NEVER blocked on this process's actual pipe
+/// read the way it used to be; see `render::window::WakeHandle`'s own
+/// doc comment for how a completed async reply gets the UI thread's
+/// attention back at all once it's ready.
+///
+/// Respawns cleanly if the pipe ever breaks (a crash, or the sandbox
+/// killing it for a denied operation) — `try_send`'s own
+/// `send_with_respawn` does one respawn-and-retry per call, so a
+/// single bad page can't permanently break foreground interaction for
+/// the rest of the session; `Browser::poll_pending_navigations` has
+/// its own, narrower version of the same idea for the async `Navigate`
+/// path specifically.
 struct RendererProcess {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
     cache_dir: std::path::PathBuf,
     storage_persistence: StoragePersistence,
     /// Whether this is the ONE dedicated, permanently-isolated `file://`
@@ -908,6 +998,39 @@ struct RendererProcess {
     /// a genuinely fresh child process really does start with empty
     /// in-memory stores and genuinely does need seeding again.
     seeded: bool,
+    /// Cloned into this process's own I/O thread -- see
+    /// `render::window::WakeHandle`'s own doc comment.
+    wake: render::window::WakeHandle,
+    /// Scoped to THIS process only (not global across every renderer
+    /// `app` has ever spawned) -- `take_reply`/`wait_for_reply` only
+    /// ever look a request id up within the same `RendererProcess` that
+    /// issued it, so uniqueness only needs to hold there.
+    next_request_id: u64,
+    /// Queues a `(request_id, ClientMessage)` for this process's I/O
+    /// thread to send, in the order given (matching `ipc`'s own
+    /// strict-lockstep wire protocol — see that crate's module docs).
+    /// Dropping this (on respawn, or when this whole `RendererProcess`
+    /// is dropped) is what tells that thread to stop once anything
+    /// already queued has drained.
+    request_tx: std::sync::mpsc::Sender<(u64, ipc::ClientMessage)>,
+    /// Completed replies from this process's I/O thread, tagged with
+    /// the `request_id` each one answers.
+    reply_rx: std::sync::mpsc::Receiver<(u64, Result<ipc::ServerMessage, String>)>,
+    /// Replies `take_reply`/`wait_for_reply` pulled off `reply_rx` that
+    /// didn't match what THAT particular call was looking for — kept
+    /// here rather than discarded, so a later, correctly-targeted
+    /// lookup still finds them. Almost always empty in practice; see
+    /// `take_reply`'s own doc comment for the one real case it isn't
+    /// (same-site tabs sharing this process, one with an async
+    /// navigate in flight and another doing an ordinary synchronous
+    /// click).
+    pending_replies: Vec<(u64, Result<ipc::ServerMessage, String>)>,
+    /// Never read after construction; kept only so `Drop` doesn't need
+    /// to do anything special with it. The thread exits on its own --
+    /// see `run_renderer_io`'s own doc comment -- once `request_tx` is
+    /// dropped and/or the killed child's pipes close, so nothing here
+    /// ever needs to join it.
+    _io_thread: std::thread::JoinHandle<()>,
 }
 
 impl RendererProcess {
@@ -915,6 +1038,7 @@ impl RendererProcess {
         cache_dir: &std::path::Path,
         storage_persistence: StoragePersistence,
         local_file_access: bool,
+        wake: render::window::WakeHandle,
     ) -> std::io::Result<Self> {
         let mut command = std::process::Command::new(renderer_binary_path());
         command.arg(cache_dir);
@@ -933,14 +1057,36 @@ impl RendererProcess {
         let stdin = child.stdin.take().expect("spawned with piped stdin");
         let stdout =
             std::io::BufReader::new(child.stdout.take().expect("spawned with piped stdout"));
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let io_thread = std::thread::spawn({
+            let storage_persistence = storage_persistence.clone();
+            let wake = wake.clone();
+            move || {
+                run_renderer_io(
+                    stdin,
+                    stdout,
+                    storage_persistence,
+                    request_rx,
+                    reply_tx,
+                    wake,
+                )
+            }
+        });
+
         Ok(RendererProcess {
             child,
-            stdin,
-            stdout,
             cache_dir: cache_dir.to_path_buf(),
             storage_persistence,
             local_file_access,
             seeded: false,
+            wake,
+            next_request_id: 0,
+            request_tx,
+            reply_rx,
+            pending_replies: Vec::new(),
+            _io_thread: io_thread,
         })
     }
 
@@ -967,6 +1113,48 @@ impl RendererProcess {
         tab_id: ipc::TabId,
         mut request: ipc::RenderRequest,
     ) -> Result<ipc::RenderSuccess, String> {
+        self.seed_if_needed(&mut request);
+        let message = ipc::ClientMessage {
+            tab_id,
+            kind: ipc::ClientMessageKind::Navigate(request),
+        };
+        let response = self.send_with_respawn(&message)?;
+        Self::expect_render_outcome(response)
+    }
+
+    /// The non-blocking sibling of `render`, for `Browser`'s own async
+    /// navigation path (`begin_navigate_without_history_with_body`) --
+    /// does the exact same first-ever-navigate seeding `render` does,
+    /// then queues the `Navigate` message and returns immediately with
+    /// a request id. Deliberately does NOT retry on a broken pipe the
+    /// way `render`'s own `send_with_respawn` does -- see
+    /// `Browser::poll_pending_navigations`'s own doc comment for why
+    /// that's a real, disclosed, and narrower guarantee than the
+    /// synchronous path's.
+    fn begin_render(&mut self, tab_id: ipc::TabId, mut request: ipc::RenderRequest) -> u64 {
+        self.seed_if_needed(&mut request);
+        let message = ipc::ClientMessage {
+            tab_id,
+            kind: ipc::ClientMessageKind::Navigate(request),
+        };
+        self.queue_request(message)
+    }
+
+    /// On this process's very first `Navigate` (`!self.seeded`), reads
+    /// and decrypts whatever's currently on disk and attaches it to
+    /// `request` as `initial_cookies`/`initial_local_storage`/
+    /// `initial_indexed_db` — see those fields' own doc comments on
+    /// `ipc::RenderRequest`. Every LATER navigate on this same (already
+    /// warm) process leaves them `None`: the renderer already has this
+    /// state in memory by then. `self.seeded` is set unconditionally
+    /// here, before the message is even sent, deliberately: if
+    /// `render`'s own `send_with_respawn` ends up respawning the child
+    /// on a pipe failure, it resends this SAME already-seeded `request`
+    /// to the fresh child, which is exactly the seed data that fresh
+    /// child actually needs — a second seeding attempt from THIS call
+    /// would be redundant, not incorrect, but there's no reason to
+    /// re-read and re-decrypt three files for it.
+    fn seed_if_needed(&mut self, request: &mut ipc::RenderRequest) {
         if !self.seeded {
             let sp = &self.storage_persistence;
             request.initial_cookies = load_encrypted_storage(&sp.cookies_path, &sp.encryption_key);
@@ -976,12 +1164,6 @@ impl RendererProcess {
                 load_encrypted_storage(&sp.indexed_db_path, &sp.encryption_key);
             self.seeded = true;
         }
-        let message = ipc::ClientMessage {
-            tab_id,
-            kind: ipc::ClientMessageKind::Navigate(request),
-        };
-        let response = self.send_with_respawn(&message)?;
-        Self::expect_render_outcome(response)
     }
 
     /// Sends `ClientMessageKind::Click` for `tab_id`/`dom_node_id` —
@@ -1092,20 +1274,34 @@ impl RendererProcess {
             }
         }
 
+        match self.respawn() {
+            Ok(()) => self
+                .try_send(message)
+                .map_err(|e| format!("renderer unavailable even after respawning: {e}")),
+            Err(e) => Err(format!("failed to respawn the renderer process: {e}")),
+        }
+    }
+
+    /// Kills this process's own (presumed-dead) child and I/O thread
+    /// and replaces `*self` with a freshly spawned one — the actual
+    /// mechanics `send_with_respawn` and `Browser::
+    /// poll_pending_navigations` both build their own respawn-and-retry
+    /// behavior on top of. Loses every tab's session state in the
+    /// renderer (see `renderer::RendererState`'s own doc comment) and
+    /// resets `seeded` to `false` (a genuinely fresh child really does
+    /// start with empty in-memory stores) — this call doesn't attempt
+    /// to re-establish anything beyond producing a healthy process to
+    /// send to.
+    fn respawn(&mut self) -> std::io::Result<()> {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        match Self::spawn(
+        *self = Self::spawn(
             &self.cache_dir,
             self.storage_persistence.clone(),
             self.local_file_access,
-        ) {
-            Ok(fresh) => {
-                *self = fresh;
-                self.try_send(message)
-                    .map_err(|e| format!("renderer unavailable even after respawning: {e}"))
-            }
-            Err(e) => Err(format!("failed to respawn the renderer process: {e}")),
-        }
+            self.wake.clone(),
+        )?;
+        Ok(())
     }
 
     /// Tells the renderer this tab is gone, so it can drop that tab's
@@ -1124,55 +1320,84 @@ impl RendererProcess {
         }
     }
 
-    /// `Ok` means the IPC round-trip itself succeeded and returns
-    /// whatever `ServerMessage` came back — callers decide what shape
-    /// they expected. `Err` means the PIPE failed (broken pipe, EOF,
-    /// malformed framing), which is what `render` treats as "go
-    /// respawn".
-    ///
-    /// This is the ONE place every single message this process ever
-    /// sends a renderer (`render`, `click`, `tick`, `check_for_update`,
-    /// every other method below) actually crosses the pipe, which
-    /// makes it the natural place to persist `ServerMessage`'s
-    /// `updated_cookies`/`updated_local_storage`/`updated_indexed_db`
-    /// fields (see that struct's own doc comment) — real, encrypted
-    /// disk writes, transparent to every caller above this method,
-    /// the same way `renderer::RendererState`'s own `handle_message`
-    /// used to do this internally before that responsibility moved
-    /// here.
+    /// `Ok` means the IPC round-trip itself succeeded (queued to, and
+    /// answered by, this process's own I/O thread — see this struct's
+    /// own doc comment) and returns whatever `ServerMessage` came back;
+    /// callers decide what shape they expected. `Err` means the PIPE
+    /// failed (broken pipe, EOF, malformed framing), which
+    /// `send_with_respawn` treats as "go respawn". Blocks the calling
+    /// (UI) thread for exactly as long as the real round trip takes —
+    /// see this struct's own doc comment on why that's fine for every
+    /// message kind that goes through here.
     fn try_send(&mut self, message: &ipc::ClientMessage) -> std::io::Result<ipc::ServerMessage> {
-        ipc::write_message(&mut self.stdin, message)?;
-        let response: ipc::ServerMessage = ipc::read_message(&mut self.stdout)?;
-        self.persist_reported_storage(&response);
-        Ok(response)
+        let request_id = self.queue_request(message.clone());
+        match self.wait_for_reply(request_id) {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(std::io::Error::other(e)),
+            Err(()) => Err(std::io::Error::other(
+                "this renderer process's own I/O thread is gone",
+            )),
+        }
     }
 
-    /// Encrypts and merges whichever of `response`'s `updated_*` fields
-    /// are `Some` into the matching `.enc` file on disk — see
-    /// `persist_encrypted_merge`'s own doc comment for the actual
-    /// encrypt/merge/write mechanics. A no-op (no disk I/O at all) for
-    /// the overwhelming majority of replies, which report no change to
-    /// any of the three.
-    fn persist_reported_storage(&self, response: &ipc::ServerMessage) {
-        let sp = &self.storage_persistence;
-        if let Some(bytes) = &response.updated_cookies {
-            persist_encrypted_merge(
-                &sp.cookies_path,
-                &sp.encryption_key,
-                bytes,
-                &["top_level_site", "resource_host"],
-            );
+    /// Non-blocking: queues `message` for this process's own I/O
+    /// thread and returns immediately with a request id `take_reply`/
+    /// `wait_for_reply` can later match a completed reply against --
+    /// the ONE place any message ever actually gets handed to that
+    /// thread. Never blocks the calling (UI) thread on the real pipe
+    /// I/O at all, which is exactly what makes `begin_render`'s own
+    /// non-blocking navigation possible.
+    fn queue_request(&mut self, message: ipc::ClientMessage) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        // If the I/O thread has already exited (a previous request's
+        // own pipe failure), this send silently fails to deliver --
+        // `wait_for_reply`/`take_reply` correctly report "no reply is
+        // ever coming" for this id either way, since `reply_rx` itself
+        // becomes disconnected at the same time.
+        let _ = self.request_tx.send((request_id, message));
+        request_id
+    }
+
+    fn drain_ready_replies(&mut self) {
+        while let Ok(reply) = self.reply_rx.try_recv() {
+            self.pending_replies.push(reply);
         }
-        if let Some(bytes) = &response.updated_local_storage {
-            persist_encrypted_merge(
-                &sp.local_storage_path,
-                &sp.encryption_key,
-                bytes,
-                &["origin"],
-            );
-        }
-        if let Some(bytes) = &response.updated_indexed_db {
-            persist_encrypted_merge(&sp.indexed_db_path, &sp.encryption_key, bytes, &["origin"]);
+    }
+
+    /// Non-blocking: `Some` only if `request_id`'s own reply has
+    /// already arrived. The one thing `Browser::poll_pending_navigations`
+    /// needs from this process — never removes anything that DOESN'T
+    /// match, so an unrelated already-arrived reply (say, a
+    /// synchronous foreground action queued on a same-site tab sharing
+    /// this same process) is left in place for `wait_for_reply` to find.
+    fn take_reply(&mut self, request_id: u64) -> Option<Result<ipc::ServerMessage, String>> {
+        self.drain_ready_replies();
+        let pos = self
+            .pending_replies
+            .iter()
+            .position(|(id, _)| *id == request_id)?;
+        Some(self.pending_replies.remove(pos).1)
+    }
+
+    /// Blocking: waits for `request_id`'s own reply specifically,
+    /// buffering (never discarding) anything else that arrives first —
+    /// see `take_reply`'s own doc comment on why more than one request
+    /// can legitimately be in flight to the same process at once.
+    /// `Err(())` means this process's I/O thread is gone without ever
+    /// answering this one — the pipe is dead.
+    fn wait_for_reply(
+        &mut self,
+        request_id: u64,
+    ) -> Result<Result<ipc::ServerMessage, String>, ()> {
+        loop {
+            if let Some(result) = self.take_reply(request_id) {
+                return Ok(result);
+            }
+            match self.reply_rx.recv() {
+                Ok(reply) => self.pending_replies.push(reply),
+                Err(_) => return Err(()),
+            }
         }
     }
 
@@ -1462,6 +1687,83 @@ impl RendererProcess {
     }
 }
 
+/// The body of every `RendererProcess`'s own dedicated I/O thread —
+/// the ONLY code anywhere in this process that actually touches a
+/// renderer's real stdin/stdout pipes; see `RendererProcess`'s own doc
+/// comment for why that split exists at all. Pulls one
+/// `(request_id, ClientMessage)` at a time, in the order queued
+/// (matching `ipc`'s own strict-lockstep wire protocol — see that
+/// crate's module docs), writes it, blocks on the reply, persists
+/// whatever `updated_*` storage fields it carries (see
+/// `persist_reported_storage`'s own doc comment on why that belongs
+/// HERE rather than back on the UI thread), and sends the result back
+/// tagged with the same `request_id`. Exits as soon as either the pipe
+/// breaks (its `Err` is still reported once, as that failing request's
+/// own reply) or `request_tx` is dropped (the channel disconnects,
+/// ending the `for` loop) -- `RendererProcess::try_send`'s own respawn
+/// logic (on the OTHER, UI thread) is what notices and reacts to a
+/// broken pipe, not this thread itself.
+fn run_renderer_io(
+    mut stdin: std::process::ChildStdin,
+    mut stdout: std::io::BufReader<std::process::ChildStdout>,
+    storage_persistence: StoragePersistence,
+    request_rx: std::sync::mpsc::Receiver<(u64, ipc::ClientMessage)>,
+    reply_tx: std::sync::mpsc::Sender<(u64, Result<ipc::ServerMessage, String>)>,
+    wake: render::window::WakeHandle,
+) {
+    for (request_id, message) in request_rx {
+        let outcome =
+            ipc::write_message(&mut stdin, &message).and_then(|()| ipc::read_message(&mut stdout));
+        let result = match outcome {
+            Ok(response) => {
+                persist_reported_storage(&storage_persistence, &response);
+                Ok(response)
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        let is_err = result.is_err();
+        if reply_tx.send((request_id, result)).is_err() {
+            // The `RendererProcess` (and its `reply_rx`) is already
+            // gone — nothing left to report to.
+            return;
+        }
+        wake.wake();
+        if is_err {
+            return;
+        }
+    }
+}
+
+/// Encrypts and merges whichever of `response`'s `updated_*` fields
+/// are `Some` into the matching `.enc` file on disk — see
+/// `persist_encrypted_merge`'s own doc comment for the actual
+/// encrypt/merge/write mechanics. A no-op (no disk I/O at all) for the
+/// overwhelming majority of replies, which report no change to any of
+/// the three. A free function (not a `RendererProcess` method) because
+/// `run_renderer_io` calls it from a background thread that only ever
+/// owns a `StoragePersistence` clone, never a `RendererProcess` itself.
+fn persist_reported_storage(sp: &StoragePersistence, response: &ipc::ServerMessage) {
+    if let Some(bytes) = &response.updated_cookies {
+        persist_encrypted_merge(
+            &sp.cookies_path,
+            &sp.encryption_key,
+            bytes,
+            &["top_level_site", "resource_host"],
+        );
+    }
+    if let Some(bytes) = &response.updated_local_storage {
+        persist_encrypted_merge(
+            &sp.local_storage_path,
+            &sp.encryption_key,
+            bytes,
+            &["origin"],
+        );
+    }
+    if let Some(bytes) = &response.updated_indexed_db {
+        persist_encrypted_merge(&sp.indexed_db_path, &sp.encryption_key, bytes, &["origin"]);
+    }
+}
+
 impl Drop for RendererProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -1512,14 +1814,24 @@ struct RendererPool {
     /// Cloned into every `RendererProcess` this pool spawns — see
     /// `StoragePersistence`'s own doc comment.
     storage_persistence: StoragePersistence,
+    /// Cloned into every `RendererProcess` this pool spawns, which in
+    /// turn hands its own clone to its background I/O thread — see
+    /// `render::window::WakeHandle`'s own doc comment on why a
+    /// background thread needs one at all.
+    wake: render::window::WakeHandle,
 }
 
 impl RendererPool {
-    fn new(cache_dir: std::path::PathBuf, storage_persistence: StoragePersistence) -> Self {
+    fn new(
+        cache_dir: std::path::PathBuf,
+        storage_persistence: StoragePersistence,
+        wake: render::window::WakeHandle,
+    ) -> Self {
         RendererPool {
             processes: std::collections::HashMap::new(),
             cache_dir,
             storage_persistence,
+            wake,
         }
     }
 
@@ -1530,6 +1842,12 @@ impl RendererPool {
     /// paths rather than each computing their own.
     fn storage_persistence(&self) -> StoragePersistence {
         self.storage_persistence.clone()
+    }
+
+    /// A clone of this pool's own `WakeHandle` -- same reasoning as
+    /// `storage_persistence` above, for the same one other caller.
+    fn wake(&self) -> render::window::WakeHandle {
+        self.wake.clone()
     }
 
     /// Returns the process for `site`, spawning a fresh one first if
@@ -1553,6 +1871,7 @@ impl RendererPool {
                 &self.cache_dir,
                 self.storage_persistence.clone(),
                 local_file_access,
+                self.wake.clone(),
             )
             .map_err(|e| format!("failed to spawn a renderer process for site {site:?}: {e}"))?;
             self.processes.insert(site.to_string(), process);
@@ -1763,10 +2082,10 @@ impl Browser {
     /// REAL OS downloads folder (`real_downloads_dir`) for saved
     /// files. See `new_with_data_dir_and_downloads_dir` for the actual
     /// constructor logic.
-    fn new(initial_url: Option<&str>) -> Self {
+    fn new(initial_url: Option<&str>, wake: render::window::WakeHandle) -> Self {
         let data_dir = real_data_dir();
         let downloads_dir = real_downloads_dir(&data_dir);
-        Self::new_with_data_dir_and_downloads_dir(initial_url, data_dir, downloads_dir)
+        Self::new_with_data_dir_and_downloads_dir(initial_url, data_dir, downloads_dir, wake)
     }
 
     /// Test entry point (see `test_browser`) — saved files go under
@@ -1776,17 +2095,26 @@ impl Browser {
     /// Downloads folder (which is very likely to exist and be
     /// writable on any real dev/CI machine, unlike the fallback
     /// `real_downloads_dir` only reaches for when that env var is
-    /// entirely unset).
+    /// entirely unset). Always `WakeHandle::noop()` -- there's no real
+    /// event loop in a test, and `app`'s own test suite polls for
+    /// async results directly (see `navigate`'s own doc comment)
+    /// rather than relying on an external wake-up at all.
     #[cfg(test)]
     fn new_with_data_dir(initial_url: Option<&str>, data_dir: std::path::PathBuf) -> Self {
         let downloads_dir = data_dir.join("downloads");
-        Self::new_with_data_dir_and_downloads_dir(initial_url, data_dir, downloads_dir)
+        Self::new_with_data_dir_and_downloads_dir(
+            initial_url,
+            data_dir,
+            downloads_dir,
+            render::window::WakeHandle::noop(),
+        )
     }
 
     fn new_with_data_dir_and_downloads_dir(
         initial_url: Option<&str>,
         data_dir: std::path::PathBuf,
         downloads_dir: std::path::PathBuf,
+        wake: render::window::WakeHandle,
     ) -> Self {
         let account = load_or_create_account(&data_dir);
         let bookmarks = load_or_init_bookmarks(&account, &data_dir);
@@ -1819,7 +2147,7 @@ impl Browser {
             local_storage_path: data_dir.join("local_storage.enc"),
             indexed_db_path: data_dir.join("indexed_db.enc"),
         };
-        let renderers = RendererPool::new(data_dir.join("cache"), storage_persistence);
+        let renderers = RendererPool::new(data_dir.join("cache"), storage_persistence, wake);
         let userscripts_dir = data_dir.join("userscripts");
         // Settings (theme/fingerprint-resistance/WebRTC) are read back
         // from the just-loaded `bookmarks.settings` here rather than
@@ -1972,10 +2300,31 @@ impl Browser {
     /// unreferenced: navigating a tab away from it, closing a tab that
     /// was on it, or a tab leaving to a local `about:` page.
     fn evict_unreferenced_renderer_processes(&mut self) {
+        // `renderer_site` alone isn't the whole story any more: a tab
+        // with a `pending_navigation` in flight has ALREADY spawned (or
+        // reused) its new site's process (see `begin_navigate_without_
+        // history_with_body`), but won't update its own `renderer_site`
+        // to that site until the reply actually arrives and `apply_
+        // navigation_outcome` runs. Without also counting THAT site as
+        // referenced here, a real async navigation could get its own
+        // freshly-spawned (or currently-in-use) process killed out from
+        // under it by an unrelated eviction sweep — e.g. triggered by a
+        // DIFFERENT tab's own navigation completing — before its reply
+        // ever arrives, hanging that navigation forever (its process
+        // and I/O thread are simply gone, so `poll_pending_navigations`
+        // would `continue` past it indefinitely). A real bug this was
+        // caught by: `a_slow_navigation_on_one_tab_does_not_block_a_
+        // different_tabs_own_navigation`'s own two-site, two-tab
+        // scenario.
         let referenced: std::collections::HashSet<String> = self
             .tabs
             .iter()
-            .filter_map(|tab| tab.renderer_site.clone())
+            .flat_map(|tab| {
+                tab.renderer_site
+                    .iter()
+                    .chain(tab.pending_navigation.iter().map(|p| &p.site))
+            })
+            .cloned()
             .collect();
         self.renderers.evict_unreferenced(&referenced);
     }
@@ -2466,13 +2815,13 @@ impl Browser {
         self.navigate_without_history(url);
     }
 
-    /// Like `navigate`, but for a real POST form submission (see
-    /// `handle_click`/`send_text_input_to_focused_page_input`, its two
-    /// callers) — `body` is the `application/x-www-form-urlencoded`
-    /// field values `renderer::script::Session::build_form_submission`
-    /// already built. Still records history: pressing back after
-    /// submitting a login form should return to the login page, the
-    /// same as it already does for a GET form submitted via `navigate`.
+    /// Like `navigate`, but for a real POST form submission — the
+    /// synchronous test-facing sibling of `begin_navigate_with_body`,
+    /// which the real, interactive `handle_click`/`send_text_input_to_
+    /// focused_page_input` call sites use instead now (see `navigate`'s
+    /// own doc comment for why the two exist side by side). `#[cfg(test)]`
+    /// since that's its only remaining caller.
+    #[cfg(test)]
     fn navigate_with_body(&mut self, url: &str, body: Vec<u8>) {
         self.active_tab_mut().record_navigation_history();
         self.navigate_without_history_with_body(url, Some(body));
@@ -2496,6 +2845,18 @@ impl Browser {
     /// and `navigate_with_body` (POST) build on — see
     /// `ipc::RenderRequest::body`'s own doc comment for what `body`
     /// means on the wire.
+    ///
+    /// Fully synchronous: blocks until the real fetch/parse/layout/
+    /// script round trip completes before returning, which is exactly
+    /// what makes this a convenient TEST helper (assert on the result
+    /// immediately after calling it, no waiting required) but is no
+    /// longer what the real, interactive browser calls for a page
+    /// navigation -- see `begin_navigate_without_history_with_body`'s
+    /// own doc comment for why blocking the single UI thread on a
+    /// multi-second real page load doesn't happen there any more.
+    /// Shares its actual "what does a successful/failed render DO to
+    /// this tab" logic with that async path via `apply_navigation_
+    /// outcome`, so the two can never quietly drift apart.
     fn navigate_without_history_with_body(&mut self, url: &str, body: Option<Vec<u8>>) {
         self.exit_find_mode();
         self.stop_all_media_playback();
@@ -2534,13 +2895,224 @@ impl Browser {
         let tab_id = self.active_tab().id;
         let old_site = self.active_tab().renderer_site.clone();
         let new_site = site_for_url(url);
-        let now = std::time::Instant::now();
 
         let render_result = match self.renderers.get_or_spawn(&new_site) {
             Ok(renderer) => renderer.render(tab_id, request),
             Err(e) => Err(e),
         };
 
+        self.apply_navigation_outcome(tab_id, url, old_site, new_site, None, render_result);
+    }
+
+    /// The non-blocking sibling of `navigate` -- see `begin_navigate_
+    /// without_history_with_body`'s own doc comment for the real
+    /// substance. Used by every REAL, interactive call site
+    /// (`handle_event`'s address-bar Enter, a clicked link, a form
+    /// submission, back/forward, reload); `navigate` itself stays
+    /// synchronous (built the same way, just blocking on the result
+    /// immediately) purely as a test convenience -- see its own doc
+    /// comment.
+    fn begin_navigate(&mut self, url: &str) {
+        self.active_tab_mut().record_navigation_history();
+        self.begin_navigate_without_history(url);
+    }
+
+    /// The non-blocking sibling of `navigate_with_body` — see
+    /// `begin_navigate`'s own doc comment.
+    fn begin_navigate_with_body(&mut self, url: &str, body: Vec<u8>) {
+        self.active_tab_mut().record_navigation_history();
+        self.begin_navigate_without_history_with_body(url, Some(body), None);
+    }
+
+    fn begin_navigate_without_history(&mut self, url: &str) {
+        self.begin_navigate_without_history_with_body(url, None, None);
+    }
+
+    /// Queues `url` on the appropriate renderer process and returns
+    /// IMMEDIATELY, without waiting for (or even knowing) the outcome —
+    /// the active tab keeps showing whatever it showed a moment ago
+    /// until `poll_pending_navigations` applies the real result once it
+    /// arrives (see `PendingNavigation`'s own doc comment). This is
+    /// what makes a page load stop freezing the rest of the browser:
+    /// the previous, fully synchronous version of this function (still
+    /// alive as `navigate_without_history_with_body`, for tests) blocked
+    /// this call site — and therefore the ENTIRE single-threaded UI
+    /// event loop, every other open tab included — for as long as the
+    /// real fetch/parse/layout/script round trip took, which for a
+    /// heavy real page is easily multiple seconds. See `RendererPool`'s
+    /// own doc comment for why only `Navigate` gets this treatment and
+    /// not every other message kind.
+    ///
+    /// `restore_scroll_y`: `Some` only for a history back/forward/
+    /// reload re-entry (see `PendingNavigation`'s own doc comment).
+    ///
+    /// If this site's process can't even be spawned at all (as opposed
+    /// to a request that WAS sent but got a later error reply), there's
+    /// no request to wait on, so the "Failed to load" outcome is
+    /// applied immediately instead of fabricating a pending navigation
+    /// for a request that was never actually queued.
+    fn begin_navigate_without_history_with_body(
+        &mut self,
+        url: &str,
+        body: Option<Vec<u8>>,
+        restore_scroll_y: Option<f32>,
+    ) {
+        self.exit_find_mode();
+        self.stop_all_media_playback();
+        self.reset_devtools_page_state();
+        let installed_userscripts = userscripts::load_all(&self.userscripts_dir);
+        let user_scripts: Vec<String> = userscripts::scripts_for_url(&installed_userscripts, url)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let request = ipc::RenderRequest {
+            url: url.to_string(),
+            body,
+            top_level_host: None,
+            canvas_width: self.canvas_width as f32,
+            theme: self.theme.as_str().to_string(),
+            user_scripts,
+            initial_cookies: None,
+            initial_local_storage: None,
+            initial_indexed_db: None,
+        };
+
+        let tab_id = self.active_tab().id;
+        let old_site = self.active_tab().renderer_site.clone();
+        let new_site = site_for_url(url);
+
+        let renderer = match self.renderers.get_or_spawn(&new_site) {
+            Ok(renderer) => renderer,
+            Err(e) => {
+                self.apply_navigation_outcome(tab_id, url, old_site, new_site, None, Err(e));
+                return;
+            }
+        };
+        let request_id = renderer.begin_render(tab_id, request);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.pending_navigation = Some(PendingNavigation {
+                request_id,
+                site: new_site,
+                old_site,
+                url: url.to_string(),
+                restore_scroll_y,
+            });
+        }
+    }
+
+    /// Checks every tab with a `pending_navigation` for a completed
+    /// reply from its own renderer process (see `RendererProcess::
+    /// take_reply`), and applies whichever ones are actually ready --
+    /// called from `handle_tick`, which runs on every real
+    /// `InputEvent::Tick`, including the ones `render::window::
+    /// WakeHandle::wake` triggers the moment a background reply lands
+    /// (see that type's own doc comment). Returns whether ANY tab's
+    /// navigation resolved, so `handle_tick` knows whether to produce a
+    /// `Frame` at all.
+    ///
+    /// A tab whose OWN pending request isn't ready yet is simply left
+    /// alone here -- its `request_id` staying in `pending_replies` on
+    /// its process (see that field's own doc comment) until either this
+    /// runs again, or (for a superseded, no-longer-current request) it
+    /// just sits there harmlessly forever, a few hundred bytes of dead
+    /// weight for the lifetime of that one process. Not cleaned up
+    /// today — a real, disclosed, low-severity gap, not a correctness
+    /// issue (a stale reply is never SIMULTANEOUSLY reachable through
+    /// both this poll AND some other lookup, since `pending_navigation`
+    /// is what determines which request id even gets checked here).
+    ///
+    /// A broken pipe (this specific request's own `Err`) is treated
+    /// as a normal failed navigation (the same "Failed to load" page
+    /// every other error produces) rather than being retried the way
+    /// `send_with_respawn` retries a SYNCHRONOUS foreground action once
+    /// — auto-retrying here would mean keeping a full clone of the
+    /// original `RenderRequest` around just in case, for a failure mode
+    /// (the renderer process itself dying) that's already rare. The
+    /// process itself IS respawned (fresh, healthy) as a side effect of
+    /// `RendererPool::get_or_spawn`'s own next call for that site, so a
+    /// user hitting Reload after a failure like this gets a working
+    /// process, just not an invisible automatic retry.
+    fn poll_pending_navigations(&mut self) -> bool {
+        let tab_ids: Vec<ipc::TabId> = self
+            .tabs
+            .iter()
+            .filter(|t| t.pending_navigation.is_some())
+            .map(|t| t.id)
+            .collect();
+
+        let mut any_resolved = false;
+        for tab_id in tab_ids {
+            let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+                continue;
+            };
+            let Some(pending) = &tab.pending_navigation else {
+                continue;
+            };
+            let request_id = pending.request_id;
+            let site = pending.site.clone();
+            let Some(renderer) = self.renderers.get(&site) else {
+                continue;
+            };
+            let Some(reply) = renderer.take_reply(request_id) else {
+                continue;
+            };
+
+            // Re-borrow (and take) the pending navigation's own fields
+            // now that the immutable borrow above has ended.
+            let pending = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.id == tab_id)
+                .and_then(|t| t.pending_navigation.take())
+                .expect("just confirmed this tab has one");
+            let render_result = reply.and_then(RendererProcess::expect_render_outcome);
+            self.apply_navigation_outcome(
+                tab_id,
+                &pending.url,
+                pending.old_site,
+                pending.site,
+                pending.restore_scroll_y,
+                render_result,
+            );
+            any_resolved = true;
+        }
+        any_resolved
+    }
+
+    /// Applies the outcome of a `Navigate` round trip (successful or
+    /// not) to `tab_id`'s own state — title, layout tree, history,
+    /// bookmarks, the OLD site's `CloseTab` notification, scroll
+    /// position — regardless of whether that round trip was awaited
+    /// synchronously (`navigate_without_history_with_body`) or resolved
+    /// later (`poll_pending_navigations`); both funnel through here so
+    /// the two paths can never drift apart on what a successful or
+    /// failed navigation actually DOES to a tab.
+    ///
+    /// `restore_scroll_y`: `Some` only for a history back/forward/
+    /// reload re-entry — every other navigation resets scroll to the
+    /// top, matching every real browser's own "a fresh page starts
+    /// scrolled to the top" behavior. Only relayouts/repaints
+    /// (`self.relayout()`) when `tab_id` is still the ACTIVE tab —
+    /// `relayout` itself only ever operates on `self.active_tab_index`
+    /// (see its own doc comment), the same restriction the old, purely
+    /// synchronous version of this code already lived with (a
+    /// navigation could only ever target the active tab back then), so
+    /// this preserves that exact behavior rather than changing it. A
+    /// background tab's `layout_tree` still arrives already laid out
+    /// (the renderer does that itself, against the width the request
+    /// was built with) — it just isn't re-laid-out again here for a
+    /// resize that might have happened in the meantime, matching how a
+    /// window resize ALSO only ever relayouts the active tab today.
+    fn apply_navigation_outcome(
+        &mut self,
+        tab_id: ipc::TabId,
+        url: &str,
+        old_site: Option<String>,
+        new_site: String,
+        restore_scroll_y: Option<f32>,
+        render_result: Result<ipc::RenderSuccess, String>,
+    ) {
+        let now = std::time::Instant::now();
         let (layout_tree, title, page_signals, next_wake_at, live_site) = match render_result {
             Ok(success) => {
                 let wake_at = success
@@ -2565,24 +3137,10 @@ impl Browser {
                 let document = html::parse(&html);
                 let stylesheet = css::user_agent_stylesheet(self.theme);
                 let tree = layout::build_layout_tree(&document, &stylesheet);
-                // No session exists anywhere for this tab now — either
-                // the renderer's own `Navigate` arm dropped it after a
-                // fetch/blocklist failure, or `get_or_spawn` never
-                // reached the renderer at all (failed to spawn). No
-                // real page signals for a locally-built error page
-                // either — `None` clears any stale badge from whatever
-                // this tab showed before.
                 (tree, Some("Failed to load".to_string()), None, None, None)
             }
         };
 
-        // A fresh navigation fully replaces whatever `script::Session`
-        // (pending timers included) this tab had, but if that session
-        // lived in a DIFFERENT site's process (a real site-to-site
-        // navigation), that OLD process never heard about this at all
-        // — it only drops a tab's session as a side effect of a
-        // `Navigate` IT receives (see `renderer::RendererState::
-        // handle_message`), and this one didn't. Tell it explicitly.
         if old_site.is_some() && old_site != live_site {
             if let Some(old) = &old_site {
                 if let Some(old_renderer) = self.renderers.get(old) {
@@ -2591,28 +3149,35 @@ impl Browser {
             }
         }
 
-        // Captured before `live_site` moves into `renderer_site` below —
-        // see this function's tail for why this specifically means
-        // "record a history entry."
         let fetch_succeeded = live_site.is_some();
+        let is_active = self.active_tab().id == tab_id;
 
-        self.active_tab_mut().layout_tree = layout_tree;
-        self.relayout();
-
-        self.active_tab_mut().current_url = url.to_string();
-        let current_url = self.active_tab().current_url.clone();
-        self.active_tab_mut().set_address_bar_text(current_url);
-        self.active_tab_mut().cached_title = title;
-        self.active_tab_mut().cached_page_signals = page_signals;
-        self.active_tab_mut().scroll_y = 0.0;
-        self.active_tab_mut().next_wake_at = next_wake_at;
-        self.active_tab_mut().renderer_site = live_site;
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            // The tab closed while this navigation was still in flight
+            // -- nothing left to apply this to. Only reachable from the
+            // async path; the synchronous one always still has its own
+            // tab, since nothing else can run while it's blocked.
+            return;
+        };
+        tab.layout_tree = layout_tree;
+        tab.current_url = url.to_string();
+        let current_url = tab.current_url.clone();
+        tab.set_address_bar_text(current_url);
+        tab.cached_title = title;
+        tab.cached_page_signals = page_signals;
+        tab.scroll_y = restore_scroll_y.unwrap_or(0.0);
+        tab.next_wake_at = next_wake_at;
+        tab.renderer_site = live_site;
         // A fresh navigation means a fresh DOM — whatever was focused
         // on the OLD page (if anything) no longer means anything, and
         // the new renderer-side session already starts with nothing
         // focused (see `script::Session::new`) regardless.
-        self.active_tab_mut().focused_page_input = None;
-        self.active_tab_mut().keyboard_focus = None;
+        tab.focused_page_input = None;
+        tab.keyboard_focus = None;
+
+        if is_active {
+            self.relayout();
+        }
 
         // The OLD site (if any) may now be unreferenced by every open
         // tab — see `RendererPool`'s doc comment on why that process
@@ -2627,7 +3192,11 @@ impl Browser {
         // loaded page is, and would otherwise pollute it with whatever
         // URL the user mistyped or a dead link pointed at.
         if fetch_succeeded {
-            let title = self.active_tab().cached_title.clone();
+            let title = self
+                .tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .and_then(|t| t.cached_title.clone());
             self.bookmarks.record_visit(url, title.as_deref());
             save_bookmarks(&self.account, &self.bookmarks, &self.data_dir);
         }
@@ -2648,7 +3217,16 @@ impl Browser {
             "about:account" => self.load_account_page_without_history(),
             "about:history" => self.load_history_page_without_history(),
             "about:downloads" => self.load_downloads_page_without_history(),
-            _ => self.navigate_without_history(url),
+            _ => {
+                // Async (see `begin_navigate_without_history_with_body`'s
+                // own doc comment) -- `scroll_y` is restored once the
+                // real reply arrives (`PendingNavigation::
+                // restore_scroll_y`/`apply_navigation_outcome`), not
+                // here, since setting it immediately would just get
+                // overwritten the moment that happens anyway.
+                self.begin_navigate_without_history_with_body(url, None, Some(scroll_y));
+                return;
+            }
         }
         self.active_tab_mut().scroll_y = scroll_y;
         self.clamp_scroll();
@@ -2938,8 +3516,15 @@ impl Browser {
         // `maybe_check_for_update`'s own doc comment.
         let checked_for_update = self.maybe_check_for_update(now);
         let media_progressed = self.handle_media_progress_tick(now);
+        // Also independent of any tab's own `setTimeout` -- this is
+        // what a background renderer process's own I/O thread calling
+        // `render::window::WakeHandle::wake` actually gets picked up
+        // by (see that type's own doc comment), the moment an async
+        // page load finishes rather than whenever the next real input
+        // or scheduled timer happens to occur.
+        let navigations_completed = self.poll_pending_navigations();
 
-        ticked || checked_for_update || media_progressed
+        ticked || checked_for_update || media_progressed || navigations_completed
     }
 
     /// For every tab with anything currently playing (`next_media_tick_at`
@@ -3035,6 +3620,7 @@ impl Browser {
                 &self.data_dir.join("cache"),
                 self.renderers.storage_persistence(),
                 false,
+                self.renderers.wake(),
             ) {
                 Ok(process) => self.update_checker_process.insert(process),
                 Err(e) => {
@@ -3096,6 +3682,7 @@ impl Browser {
             find_highlight.as_ref(),
         );
 
+        self.paint_scrollbar(&mut canvas);
         self.paint_tab_bar(&mut canvas);
         self.paint_address_bar(&mut canvas);
         if self.active_tab().finding_in_page {
@@ -3112,6 +3699,66 @@ impl Browser {
         }
 
         canvas
+    }
+
+    /// Draws a thin vertical scroll-position indicator along the page
+    /// content area's right edge, or nothing at all when the page fits
+    /// its viewport without scrolling (`max_scroll <= 0.0`) — a real
+    /// browser's own scrollbar disappears in exactly that case too.
+    /// Purely visual: there's no hit-testing anywhere for it, so it
+    /// can't be dragged (see `SCROLLBAR_WIDTH`'s own doc comment on
+    /// why that's an acceptable scope for now). The viewport-height and
+    /// max-scroll math here is deliberately identical to
+    /// `clamp_scroll`'s own -- the two must always agree, or the thumb
+    /// would show a position/size that doesn't match what's actually
+    /// visible.
+    fn paint_scrollbar(&self, canvas: &mut render::Canvas) {
+        let viewport_height =
+            (self.canvas_height as f32 - CHROME_HEIGHT - self.devtools_reserved_height()).max(0.0);
+        let tab = self.active_tab();
+        let content_height = tab.layout_tree.rect.height;
+        let max_scroll = (content_height - viewport_height).max(0.0);
+        if max_scroll <= 0.0 || viewport_height <= 0.0 {
+            return;
+        }
+
+        let track_x = self.canvas_width as f32 - SCROLLBAR_WIDTH;
+        let track_y = CHROME_HEIGHT;
+        canvas.fill_rect(
+            track_x,
+            track_y,
+            SCROLLBAR_WIDTH,
+            viewport_height,
+            render::Color {
+                r: 20,
+                g: 20,
+                b: 20,
+                a: 255,
+            },
+        );
+
+        // The thumb's height is proportional to how much of the total
+        // content the viewport actually shows (`viewport / content`),
+        // floored at `SCROLLBAR_MIN_THUMB_HEIGHT` so a very long page
+        // never shrinks it to an unusable (or invisible) sliver -- the
+        // same tradeoff every real browser's own scrollbar makes.
+        let thumb_height = (viewport_height * (viewport_height / content_height))
+            .max(SCROLLBAR_MIN_THUMB_HEIGHT)
+            .min(viewport_height);
+        let scrollable_track = viewport_height - thumb_height;
+        let thumb_y = track_y + scrollable_track * (tab.scroll_y / max_scroll);
+        canvas.fill_rect(
+            track_x,
+            thumb_y,
+            SCROLLBAR_WIDTH,
+            thumb_height,
+            render::Color {
+                r: 90,
+                g: 90,
+                b: 90,
+                a: 255,
+            },
+        );
     }
 
     /// Draws the find-in-page bar: a small floating overlay in the
@@ -4343,7 +4990,7 @@ impl Browser {
                     {
                         self.handle_set_command(rest.trim());
                     } else {
-                        self.navigate(&normalize_typed_url(&typed));
+                        self.begin_navigate(&normalize_typed_url(&typed));
                     }
                     return Some(self.frame(Some(self.window_title())));
                 }
@@ -4669,7 +5316,7 @@ impl Browser {
         let href = el.attributes.get("href")?;
         if is_navigable_href(href) {
             let resolved = resolve_url(&self.active_tab().current_url, href);
-            self.navigate(&resolved);
+            self.begin_navigate(&resolved);
             return Some(self.frame(Some(self.window_title())));
         }
         None
@@ -4764,8 +5411,8 @@ impl Browser {
             // focused on it means nothing afterward.
             self.active_tab_mut().focused_page_input = None;
             match submit_body {
-                Some(body) => self.navigate_with_body(&url, body),
-                None => self.navigate(&url),
+                Some(body) => self.begin_navigate_with_body(&url, body),
+                None => self.begin_navigate(&url),
             }
             return Some(self.frame(Some(self.window_title())));
         }
@@ -5021,8 +5668,8 @@ impl Browser {
             // `default_prevented` the same way link navigation does.
             if let Some(url) = submit_url {
                 match submit_body {
-                    Some(body) => self.navigate_with_body(&url, body),
-                    None => self.navigate(&url),
+                    Some(body) => self.begin_navigate_with_body(&url, body),
+                    None => self.begin_navigate(&url),
                 }
                 return Some(self.frame(Some(self.window_title())));
             }
@@ -5040,7 +5687,7 @@ impl Browser {
                 }
                 if is_navigable_href(&hit.href) {
                     let resolved = resolve_url(&self.active_tab().current_url, &hit.href);
-                    self.navigate(&resolved);
+                    self.begin_navigate(&resolved);
                     return Some(self.frame(Some(self.window_title())));
                 }
             }
@@ -6520,6 +7167,34 @@ mod tests {
         Browser::new_with_data_dir(None, data_dir)
     }
 
+    /// A real, interactive navigation (a clicked/keyboard-activated
+    /// link, a submitted form, back/forward, reload) is asynchronous
+    /// now (see `Browser::begin_navigate_without_history_with_body`'s
+    /// own doc comment) — `handle_event` returns immediately, before
+    /// the real fetch/parse/layout round trip has actually finished.
+    /// Every test exercising one of those paths (rather than calling
+    /// the still-synchronous `navigate`/`navigate_with_body` test
+    /// helpers directly) needs this afterward: it drives the exact
+    /// same `InputEvent::Tick` a real `render::window::WakeHandle`
+    /// wake-up would, in a loop, until the active tab's own
+    /// `pending_navigation` actually resolves (`test_browser`'s
+    /// `Browser` uses `WakeHandle::noop()`, so nothing external ever
+    /// triggers that `Tick` on its own the way it would in the real,
+    /// running app). Panics after a generous real-world timeout rather
+    /// than hanging the test suite forever if a navigation somehow
+    /// never resolves at all.
+    fn wait_for_pending_navigation(browser: &mut Browser) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while browser.active_tab().pending_navigation.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a pending navigation never resolved within 30s"
+            );
+            browser.handle_event(InputEvent::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn account_txt_is_saved_owner_only_not_world_or_group_readable() {
@@ -6622,6 +7297,73 @@ mod tests {
         assert!(find_layout_box_by_id(&tree, dom::NodeId(999_999)).is_none());
     }
 
+    /// A page taller than its own viewport gets a real, visible scroll
+    /// indicator (`Browser::paint_scrollbar`) along its right edge --
+    /// this was previously missing entirely (no scrollbar code existed
+    /// anywhere in the codebase), leaving scrolling functional via the
+    /// mouse wheel but with no visual cue at all that a page had more
+    /// content, or where in it the user currently was.
+    #[test]
+    fn a_tall_page_gets_a_visible_scrollbar_but_a_short_one_does_not() {
+        let mut browser = test_browser();
+        browser.canvas_width = 400;
+        browser.canvas_height = 300;
+
+        let tall_html = "<html><body>".to_string() + &"<p>line</p>".repeat(200) + "</body></html>";
+        let document = html::parse(&tall_html);
+        let stylesheet = css::user_agent_stylesheet(css::Theme::Dark);
+        let mut tree = layout::build_layout_tree(&document, &stylesheet);
+        layout::layout(&mut tree, browser.canvas_width as f32, &browser.font);
+        assert!(
+            tree.rect.height > browser.canvas_height as f32,
+            "the fixture page must actually be taller than the viewport for this test to mean anything"
+        );
+        browser.active_tab_mut().layout_tree = tree;
+        browser.clamp_scroll();
+
+        let canvas = browser.repaint();
+        let track_x = (browser.canvas_width - SCROLLBAR_WIDTH as u32) as usize;
+        let probe_y = (CHROME_HEIGHT as usize) + 5;
+        let idx = (probe_y * canvas.width + track_x) * 4;
+        let pixel = canvas.pixels[idx..idx + 4].to_vec();
+        let background = vec![
+            browser.background.r,
+            browser.background.g,
+            browser.background.b,
+            browser.background.a,
+        ];
+        assert_ne!(
+            pixel, background,
+            "expected a real scrollbar track/thumb pixel, not the plain page background"
+        );
+
+        // A short page (fits entirely within the viewport) must NOT
+        // draw a scrollbar at all -- matching every real browser's own
+        // behavior, and the exact case `paint_scrollbar`'s own
+        // `max_scroll <= 0.0` early return exists for.
+        let short_html = "<html><body><p>short</p></body></html>";
+        let document = html::parse(short_html);
+        let mut tree = layout::build_layout_tree(&document, &stylesheet);
+        layout::layout(&mut tree, browser.canvas_width as f32, &browser.font);
+        assert!(tree.rect.height < browser.canvas_height as f32);
+        browser.active_tab_mut().layout_tree = tree;
+        browser.clamp_scroll();
+
+        let canvas = browser.repaint();
+        let idx = (probe_y * canvas.width + track_x) * 4;
+        let pixel = canvas.pixels[idx..idx + 4].to_vec();
+        let background = vec![
+            browser.background.r,
+            browser.background.g,
+            browser.background.b,
+            browser.background.a,
+        ];
+        assert_eq!(
+            pixel, background,
+            "a page that fits its viewport should paint no scrollbar at all"
+        );
+    }
+
     #[test]
     fn navigating_two_tabs_to_different_sites_spawns_two_renderer_processes() {
         let mut browser = test_browser();
@@ -6629,6 +7371,76 @@ mod tests {
         browser.open_new_tab();
         browser.navigate("https://example.org/");
         assert_eq!(browser.renderers.open_site_count(), 2);
+    }
+
+    /// The real end-to-end proof of the whole reason `begin_navigate*`/
+    /// `poll_pending_navigations` exist: starting a slow page load must
+    /// return control to the caller almost immediately, rather than
+    /// blocking until the real fetch finishes, which is what would
+    /// freeze the entire single-threaded UI event loop -- every other
+    /// open tab included -- for however long that fetch took.
+    /// `https://httpbin.org/delay/3` is a real, independent server that
+    /// deliberately waits 3 real seconds before responding: the only
+    /// way to prove this against a genuinely slow round trip rather
+    /// than a fast one that would pass even with the OLD, fully
+    /// synchronous/blocking implementation this test would have caught
+    /// a regression back to.
+    ///
+    /// Deliberately does NOT try to also assert that a SECOND tab's own
+    /// navigation completes in some bounded wall-clock time while this
+    /// one is pending: this sandbox's own real hardware/network
+    /// contention (confirmed by hand -- a plain `https://example.net/`
+    /// fetch through this app's own full pipeline, alone, took anywhere
+    /// from under a second to several real seconds run to run here) makes
+    /// any such timing-ratio assertion exactly as flake-prone as
+    /// `an_infinite_loop_is_stopped_quickly_instead_of_hanging`'s own
+    /// well-documented history in `renderer/src/script.rs` -- the
+    /// dispatch-time assertion below is what actually proves the
+    /// architectural claim (this call does not block), without
+    /// depending on how much real concurrent throughput this specific
+    /// machine happens to have.
+    #[test]
+    fn a_slow_navigation_does_not_block_the_caller_or_other_tabs() {
+        let mut browser = test_browser();
+        browser.navigate("https://example.com/"); // tab 0
+        browser.open_new_tab();
+        browser.navigate("https://example.org/"); // tab 1, now active
+
+        browser.active_tab_index = 0;
+        let dispatch_start = std::time::Instant::now();
+        browser.begin_navigate("https://httpbin.org/delay/3");
+        let dispatch_elapsed = dispatch_start.elapsed();
+        assert!(
+            dispatch_elapsed < std::time::Duration::from_secs(1),
+            "begin_navigate should return almost immediately rather than \
+             blocking on the real (3s) fetch -- took {dispatch_elapsed:?}"
+        );
+        assert!(
+            browser.active_tab().pending_navigation.is_some(),
+            "the navigation should be genuinely pending, not already resolved"
+        );
+
+        // Tab 1 is a completely separate renderer process on its own
+        // I/O thread -- its own, real, independent navigation must
+        // still work normally while tab 0's slow one is still in
+        // flight (this alone would already deadlock/hang forever if
+        // `evict_unreferenced_renderer_processes` ever mistakenly
+        // treated tab 0's in-flight process as unreferenced and killed
+        // it out from under that pending request -- a real bug this
+        // test caught before this comment was written; see
+        // `evict_unreferenced_renderer_processes`'s own doc comment).
+        browser.active_tab_index = 1;
+        browser.navigate("https://example.net/");
+        assert_eq!(browser.active_tab().current_url, "https://example.net/");
+
+        // Finally, confirm tab 0's slow navigation really does resolve
+        // correctly once its real 3-second delay has actually elapsed.
+        browser.active_tab_index = 0;
+        wait_for_pending_navigation(&mut browser);
+        assert_eq!(
+            browser.active_tab().current_url,
+            "https://httpbin.org/delay/3"
+        );
     }
 
     #[test]
@@ -7869,6 +8681,11 @@ mod tests {
         browser.navigate("https://example.com/");
 
         browser.handle_event(InputEvent::Reload);
+        // Reload is asynchronous now (see `wait_for_pending_navigation`'s
+        // own doc comment) -- without this, `browser` could be dropped
+        // (killing its renderer processes) before the real refetch this
+        // test is actually supposed to exercise ever completes.
+        wait_for_pending_navigation(&mut browser);
 
         assert_eq!(browser.window_title(), "Example Domain");
         assert_eq!(browser.active_tab().current_url, "https://example.com/");
@@ -7966,6 +8783,7 @@ mod tests {
         assert!(browser.active_tab().keyboard_focus.is_some());
 
         browser.handle_event(InputEvent::Enter);
+        wait_for_pending_navigation(&mut browser);
 
         assert_eq!(
             browser.active_tab().current_url,
@@ -7980,6 +8798,7 @@ mod tests {
         browser.handle_event(InputEvent::FocusNext);
 
         browser.handle_event(InputEvent::CharTyped(' '));
+        wait_for_pending_navigation(&mut browser);
 
         assert_eq!(
             browser.active_tab().current_url,

@@ -95,22 +95,63 @@ use accesskit_winit::{ActionRequestEvent, Adapter as AccessibilityAdapter};
 use winit::{
     dpi::PhysicalSize,
     event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::EventLoopBuilder,
+    event_loop::{EventLoopBuilder, EventLoopProxy},
     keyboard::{Key, ModifiersState, NamedKey},
     window::WindowBuilder,
 };
 
 use crate::Canvas;
 
-/// The one custom user event this window's event loop carries — just
-/// AccessKit's own action-request bridge. An assistive technology can
-/// call AccessKit's action handler from basically any thread (see
-/// `accesskit_winit::Adapter`'s own doc comment); routing it through
-/// winit's `EventLoopProxy`/user-event mechanism is what gets it back
-/// onto the SAME thread `handler`/the GPU state already run on, rather
-/// than this module needing its own locking around them.
+/// The custom user events this window's event loop carries: AccessKit's
+/// own action-request bridge, and a generic external wake-up (see
+/// `WakeHandle`). An assistive technology can call AccessKit's action
+/// handler from basically any thread (see `accesskit_winit::Adapter`'s
+/// own doc comment); routing it through winit's `EventLoopProxy`/
+/// user-event mechanism is what gets it back onto the SAME thread
+/// `handler`/the GPU state already run on, rather than this module
+/// needing its own locking around them. `WakeHandle` reuses that exact
+/// same mechanism for a second, unrelated purpose.
 enum UserEvent {
     AccessKit(ActionRequestEvent),
+    /// See `WakeHandle`'s own doc comment.
+    ExternalWake,
+}
+
+/// A cheap, `Clone + Send` handle any OTHER thread can use to make the
+/// event loop call `handler` again with `InputEvent::Tick`, immediately
+/// -- even if it's currently idle (`ControlFlow::Wait`, no timer armed
+/// at all). The general-purpose escape hatch for "something finished on
+/// a background thread and the UI needs to notice now, not whenever the
+/// next real input event or scheduled `wake_at` happens to occur" --
+/// `app` hands one of these to every renderer process's own background
+/// I/O thread, so a page load finishing doesn't have to wait for the
+/// user to move the mouse before it appears on screen. Reuses the SAME
+/// `EventLoopProxy`/user-event plumbing this module already threads
+/// through for AccessKit's own action-request bridge (see `UserEvent`'s
+/// own doc comment) rather than inventing a second, parallel mechanism.
+#[derive(Clone)]
+pub struct WakeHandle(Option<EventLoopProxy<UserEvent>>);
+
+impl WakeHandle {
+    /// A handle with nothing real behind it -- `wake()` is then simply
+    /// a no-op. For contexts with no real event loop to wake at all
+    /// (this crate's own tests, and `app`'s own test suite, which never
+    /// opens a real window and instead polls for async results directly
+    /// rather than relying on an external wake-up).
+    pub fn noop() -> Self {
+        WakeHandle(None)
+    }
+
+    /// Best-effort: the event loop may already be gone (the window is
+    /// closing, or already closed) by the time a background thread
+    /// calls this, and there's nothing meaningful to do about that
+    /// failure -- whatever this wake-up was for no longer matters to a
+    /// window that isn't there to show it.
+    pub fn wake(&self) {
+        if let Some(proxy) = &self.0 {
+            let _ = proxy.send_event(UserEvent::ExternalWake);
+        }
+    }
 }
 
 impl From<ActionRequestEvent> for UserEvent {
@@ -636,16 +677,34 @@ impl GpuState {
 /// `apply_frame` runs, i.e. when `handler` returned `Some`. An idle
 /// window (nothing happening) uses effectively zero CPU/GPU, which is
 /// what a browser sitting on a static page should do.
-pub fn run_window(
+/// `build_handler` receives a real `WakeHandle` (see that type's own
+/// doc comment) BEFORE it builds the actual handler closure, so
+/// whatever state that closure owns (in practice, `app::Browser` and
+/// every renderer process it spawns) can hand clones of it to any
+/// background thread that needs to wake this window up later --
+/// nothing that runs before the real event loop exists could
+/// otherwise ever get hold of one. `initial_title` is shown only until
+/// `build_handler`'s own first real `Frame` (from the synthetic
+/// startup `Resized` call below) updates it, if that `Frame` sets a
+/// different one -- deferring construction of the actual handler until
+/// AFTER the event loop exists means a caller that wants the REAL
+/// starting title (built from its own already-loaded state) can no
+/// longer compute it before calling this function, but paints over
+/// this placeholder within the same synchronous startup sequence
+/// either way, which is imperceptible in practice.
+pub fn run_window<H>(
     initial_title: &str,
     icon: Option<WindowIcon>,
-    mut handler: impl FnMut(InputEvent) -> Option<Frame> + 'static,
-) {
+    build_handler: impl FnOnce(WakeHandle) -> H,
+) where
+    H: FnMut(InputEvent) -> Option<Frame> + 'static,
+{
     const RESIZE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event()
         .build()
         .expect("creating the event loop should succeed");
+    let mut handler = build_handler(WakeHandle(Some(event_loop.create_proxy())));
     let mut window_builder = WindowBuilder::new()
         .with_title(initial_title)
         // AccessKit's adapter must be created before the window is
@@ -1046,6 +1105,27 @@ pub fn run_window(
                     );
                     reschedule(elwt, resize_deadline, wake_deadline);
                 }
+            }
+            // See `WakeHandle`'s own doc comment -- a background thread
+            // (in practice, one of `app`'s own renderer-process I/O
+            // threads) is telling this event loop that something it was
+            // waiting on has happened, so it should check now rather
+            // than whenever the next real input or scheduled `wake_at`
+            // happens to occur. Reuses the SAME `InputEvent::Tick` a
+            // scheduled timer wake-up already sends -- from `handler`'s
+            // own perspective these are indistinguishable: both mean
+            // "no real input happened, but go check whatever you were
+            // waiting on."
+            Event::UserEvent(UserEvent::ExternalWake) => {
+                if let Some(frame) = handler(InputEvent::Tick) {
+                    apply_frame(
+                        &mut state,
+                        &accessibility_adapter,
+                        frame,
+                        &mut wake_deadline,
+                    );
+                }
+                reschedule(elwt, resize_deadline, wake_deadline);
             }
             _ => {}
         })
