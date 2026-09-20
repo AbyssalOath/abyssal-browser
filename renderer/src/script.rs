@@ -3986,20 +3986,31 @@ mod tests {
         // profile (measured ~3.1s per million loop iterations there,
         // vs. ~115ms in `--release` — see `LOOP_ITERATION_LIMIT`'s doc
         // comment), with the ~1.6s worst case measured in isolation.
-        // 20s (rather than something closer to that 1.6s) is
+        // 90s (rather than something closer to that 1.6s) is
         // deliberate: this whole test binary's ~190 tests run
         // concurrently by default, and on a loaded CI runner or dev
         // machine this one test's own CPU time (the only thing
         // `LOOP_ITERATION_LIMIT` actually bounds) gets stretched by
-        // scheduling contention it has no control over — confirmed via
-        // a real flake (this test alone: 1.54s; the full workspace
-        // suite running concurrently: >4s). What this assertion is
-        // actually guarding against is a genuine infinite hang (the
-        // loop limit not firing at all), which 20s still catches with
-        // enormous margin over even a badly-contended worst case.
+        // scheduling contention it has no control over. A local flake
+        // once measured this test alone at 1.54s and the full
+        // workspace suite running concurrently at >4s; a real run on a
+        // shared, 2-vCPU GitHub Actions Linux runner (building the
+        // entire workspace from scratch immediately beforehand, in the
+        // SAME job, then running the whole suite at default
+        // parallelism) blew past the original 20s bound on top of
+        // that, which is why this needed raising again rather than
+        // trusting locally-observed contention to bound CI's own. What
+        // this assertion is actually guarding against is a genuine
+        // infinite hang (the loop limit not firing at all), which 90s
+        // still catches with enormous margin over even a badly-
+        // contended worst case -- and the elapsed time is included in
+        // the failure message specifically so the NEXT time this needs
+        // recalibrating, the real number is right there instead of
+        // requiring a re-run with instrumentation added after the fact.
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(20),
-            "the loop-iteration limit should stop this quickly"
+            elapsed < std::time::Duration::from_secs(90),
+            "the loop-iteration limit should stop this quickly, took {elapsed:?}"
         );
     }
 

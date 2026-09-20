@@ -265,7 +265,24 @@ mod tests {
     /// covered without any real hardware by the pure
     /// `fill_output_buffer`/`CachedPcm` tests above; this is a bonus
     /// integration check on top, not the primary guarantee.
+    ///
+    /// `#[ignore]`d: that graceful-skip handling only covers a clean
+    /// `Result::Err` from `cpal`. On a real, headless GitHub Actions
+    /// Windows runner (no physical audio hardware at all), this
+    /// crashed the whole test BINARY with a native
+    /// `STATUS_ACCESS_VIOLATION` instead of returning `Err` -- inside
+    /// `cpal`'s own WASAPI FFI layer, which is entirely outside what
+    /// Rust's `Result`/panic-unwinding machinery can catch, no matter
+    /// how the calling code here is written. Since the logic this
+    /// would otherwise cover is already fully verified without any
+    /// real hardware (see above), excluding it from the default
+    /// `cargo test` run is the only way to keep CI GREEN without
+    /// papering over a real native crash with `catch_unwind` (which
+    /// can't catch this class of failure anyway) or a try/timeout
+    /// wrapper. Still runs with a real audio device via `cargo test --
+    /// --ignored`.
     #[test]
+    #[ignore = "opens a real audio device; crashes with STATUS_ACCESS_VIOLATION on headless Windows CI (see doc comment) -- run manually with real audio hardware"]
     fn start_playback_opens_a_real_stream_and_reaches_the_end_of_a_tiny_buffer() {
         let pcm = CachedPcm {
             samples: Arc::new(vec![0i16; 100]), // silent, ~2ms at 44.1kHz stereo
@@ -289,7 +306,12 @@ mod tests {
         );
     }
 
+    /// See `start_playback_opens_a_real_stream_and_reaches_the_end_of_
+    /// a_tiny_buffer`'s own doc comment -- this is the OTHER real-
+    /// hardware `cpal` test, and the one that actually crashed the
+    /// Windows CI test binary the first time this ran there.
     #[test]
+    #[ignore = "opens a real audio device; crashes with STATUS_ACCESS_VIOLATION on headless Windows CI (see the sibling test's doc comment) -- run manually with real audio hardware"]
     fn start_playback_resumes_from_a_given_offset() {
         let pcm = CachedPcm {
             samples: Arc::new(vec![0i16; 44_100 * 2 * 2]), // 2 real seconds, stereo, 44.1kHz

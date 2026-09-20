@@ -142,15 +142,24 @@ What this does **not** cover:
   actually apply (`abyssal-renderer`'s own log lines confirm the Job Object
   and mitigation policies are accepted at runtime, not just compiling), and
   macOS built and passed cleanly. This is still not the same as someone
-  actually using the browser day to day on either OS, and a separate, real,
-  unresolved issue turned up on that same Windows CI run: `app`'s own test
-  suite hit a native `STATUS_ACCESS_VIOLATION` crash under `cargo test`'s
-  default multi-threaded execution, with no specific test identified as the
-  cause. Mitigated in CI by serializing that platform's test run
-  (`--test-threads=1` -- see `.github/workflows/release.yml`'s own comment
-  on this), which is a real fix for a concurrency-shaped crash but an
-  UNVERIFIED one, since diagnosing it further needs real Windows hardware
-  this project's development loop still does not have.
+  actually using the browser day to day on either OS, and that same Windows
+  CI run also turned up a separate, real, now-diagnosed issue: `app`'s own
+  test suite hit a native `STATUS_ACCESS_VIOLATION` crash inside
+  `app::media_playback`'s real `cpal`/WASAPI stream-opening tests. A first
+  guess (serializing the test run, in case it was a concurrency issue) did
+  NOT fix it -- the same test crashed again, deterministically, which
+  actually ruled concurrency out rather than confirming it. The real cause:
+  this headless CI runner has no real audio hardware, and unlike a clean
+  `cpal::Error` (which those two tests already handle gracefully), a raw
+  FFI crash inside `cpal`'s own WASAPI backend bypasses Rust's
+  `Result`/panic-unwinding machinery entirely, so no amount of error
+  handling on this side of the FFI boundary could have caught it. Both
+  tests are now `#[ignore]`d (see their own doc comments in
+  `app/src/media_playback.rs`), runnable manually via `cargo test --
+  --ignored` on a machine with real audio hardware; the actual playback
+  LOGIC they'd otherwise cover is already fully verified without any real
+  hardware by the pure `fill_output_buffer`/`CachedPcm` tests in the same
+  file.
 - **Resource limits.** `sandbox::resource_limits` (Linux/macOS, via real
   `setrlimit(RLIMIT_AS)`/`setrlimit(RLIMIT_CPU)` calls, empirically verified
   on real Linux hardware to actually be enforced - `/proc/<pid>/limits` on a

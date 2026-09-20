@@ -198,9 +198,13 @@ by area rather than by date.
   `ttf-parser`) with no available fix, narrowly ignored by advisory ID in
   `.cargo/audit.toml` (not by crate name, so a real future vulnerability in
   any of them still fails CI) rather than silently disabled; and the Windows
-  release job hit a real, still only partially understood native crash
-  (`STATUS_ACCESS_VIOLATION`) under the test suite's default parallelism,
-  mitigated (not yet root-caused) by serializing that platform's test run.
+  release job hit a real native `STATUS_ACCESS_VIOLATION` crash inside
+  `app::media_playback`'s real `cpal`/WASAPI stream-opening tests, caused by
+  a raw FFI crash on a headless runner with no real audio hardware, which
+  bypasses Rust's own `Result`/panic handling entirely -- fixed by marking
+  those two hardware-touching tests `#[ignore]` (their actual logic is
+  already fully covered by hardware-free unit tests in the same file; see
+  `THREAT_MODEL.md`'s renderer-sandbox section for the full writeup).
   See `THREAT_MODEL.md`'s renderer-sandbox section for the full, honest
   writeup of that last one.
 - Documentation: `README.md`, `ARCHITECTURE.md`, `THREAT_MODEL.md`,
